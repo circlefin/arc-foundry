@@ -1,0 +1,480 @@
+use crate::{bytecode::VerifyBytecodeArgs, types::VerificationType};
+use alloy_dyn_abi::DynSolValue;
+use alloy_evm::EvmEnv;
+use alloy_primitives::{Address, Bytes, TxKind};
+use alloy_provider::{
+    Provider,
+    network::{AnyNetwork, AnyRpcBlock},
+};
+use alloy_rpc_types::BlockId;
+use clap::ValueEnum;
+use eyre::{OptionExt, Result};
+use foundry_block_explorers::{
+    contract::{ContractCreationData, ContractMetadata, Metadata},
+    errors::EtherscanError,
+    utils::lookup_compiler_version,
+};
+use foundry_common::{abi::encode_args, compile::ProjectCompiler, ignore_metadata_hash, shell};
+use foundry_compilers::artifacts::{BytecodeHash, CompactContractBytecode, EvmVersion};
+use foundry_config::Config;
+use foundry_evm::{
+    constants::DEFAULT_CREATE2_DEPLOYER,
+    core::{decode::RevertDecoder, evm::EthEvmNetwork},
+    executors::TracingExecutor,
+    opts::EvmOpts,
+    traces::TraceMode,
+    utils::{apply_chain_and_block_specific_env_changes, block_env_from_header},
+};
+use foundry_evm_networks::NetworkConfigs;
+use reqwest::Url;
+use revm::{bytecode::Bytecode, context::TxEnv, database::Database, primitives::hardfork::SpecId};
+use semver::{BuildMetadata, Version};
+use serde::{Deserialize, Serialize};
+use yansi::Paint;
+
+/// Enum to represent the type of bytecode being verified
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, ValueEnum)]
+pub enum BytecodeType {
+    #[serde(rename = "creation")]
+    Creation,
+    #[serde(rename = "runtime")]
+    Runtime,
+}
+
+impl BytecodeType {
+    /// Check if the bytecode type is creation
+    pub const fn is_creation(&self) -> bool {
+        matches!(self, Self::Creation)
+    }
+
+    /// Check if the bytecode type is runtime
+    pub const fn is_runtime(&self) -> bool {
+        matches!(self, Self::Runtime)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JsonResult {
+    pub bytecode_type: BytecodeType,
+    pub match_type: Option<VerificationType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+pub fn match_bytecodes(
+    local_bytecode: &[u8],
+    bytecode: &[u8],
+    constructor_args: &[u8],
+    is_runtime: bool,
+    bytecode_hash: BytecodeHash,
+) -> Option<VerificationType> {
+    // 1. Try full match
+    if local_bytecode == bytecode {
+        // If the bytecode_hash = 'none' in Config. Then it's always a partial match according to
+        // sourcify definitions. Ref: https://docs.sourcify.dev/docs/full-vs-partial-match/.
+        if bytecode_hash == BytecodeHash::None {
+            return Some(VerificationType::Partial);
+        }
+
+        Some(VerificationType::Full)
+    } else {
+        is_partial_match(local_bytecode, bytecode, constructor_args, is_runtime)
+            .then_some(VerificationType::Partial)
+    }
+}
+
+pub fn build_project(
+    args: &VerifyBytecodeArgs,
+    config: &Config,
+) -> Result<CompactContractBytecode> {
+    let project = config.project()?;
+    let compiler = ProjectCompiler::new();
+
+    let mut output = compiler.compile(&project)?;
+
+    let artifact = output
+        .remove_contract(&args.contract)
+        .ok_or_eyre("Build Error: Contract artifact not found locally")?;
+
+    Ok(artifact.into_contract_bytecode())
+}
+
+pub fn print_result(
+    res: Option<VerificationType>,
+    bytecode_type: BytecodeType,
+    json_results: &mut Vec<JsonResult>,
+    etherscan_config: &Metadata,
+    config: &Config,
+) {
+    if let Some(res) = res {
+        if shell::is_json() {
+            let json_res = JsonResult { bytecode_type, match_type: Some(res), message: None };
+            json_results.push(json_res);
+        } else {
+            let _ = sh_println!(
+                "{} with status {}",
+                format!("{bytecode_type:?} code matched").green().bold(),
+                res.green().bold()
+            );
+        }
+    } else if !shell::is_json() {
+        let _ = sh_err!(
+            "{bytecode_type:?} code did not match - this may be due to varying compiler settings"
+        );
+        let mismatches = find_mismatch_in_settings(etherscan_config, config);
+        for mismatch in mismatches {
+            let _ = sh_eprintln!("{}", mismatch.red().bold());
+        }
+    } else {
+        let json_res = JsonResult {
+            bytecode_type,
+            match_type: res,
+            message: Some(format!(
+                "{bytecode_type:?} code did not match - this may be due to varying compiler settings"
+            )),
+        };
+        json_results.push(json_res);
+    }
+}
+
+fn is_partial_match(
+    mut local_bytecode: &[u8],
+    mut bytecode: &[u8],
+    constructor_args: &[u8],
+    is_runtime: bool,
+) -> bool {
+    // 1. Check length of constructor args
+    if constructor_args.is_empty() || is_runtime {
+        // Assume metadata is at the end of the bytecode
+        return try_extract_and_compare_bytecode(local_bytecode, bytecode);
+    }
+
+    // If not runtime, extract constructor args from the end of the bytecode
+    bytecode = &bytecode[..bytecode.len() - constructor_args.len()];
+    local_bytecode = &local_bytecode[..local_bytecode.len() - constructor_args.len()];
+
+    try_extract_and_compare_bytecode(local_bytecode, bytecode)
+}
+
+fn try_extract_and_compare_bytecode(mut local_bytecode: &[u8], mut bytecode: &[u8]) -> bool {
+    local_bytecode = ignore_metadata_hash(local_bytecode);
+    bytecode = ignore_metadata_hash(bytecode);
+
+    // Now compare the local code and bytecode
+    local_bytecode == bytecode
+}
+
+fn find_mismatch_in_settings(
+    etherscan_settings: &Metadata,
+    local_settings: &Config,
+) -> Vec<String> {
+    let mut mismatches: Vec<String> = vec![];
+    if etherscan_settings.evm_version != local_settings.evm_version.to_string().to_lowercase() {
+        let str = format!(
+            "EVM version mismatch: local={}, onchain={}",
+            local_settings.evm_version, etherscan_settings.evm_version
+        );
+        mismatches.push(str);
+    }
+    let local_optimizer: u64 = if local_settings.optimizer == Some(true) { 1 } else { 0 };
+    if etherscan_settings.optimization_used != local_optimizer {
+        let str = format!(
+            "Optimizer mismatch: local={}, onchain={}",
+            local_settings.optimizer.unwrap_or(false),
+            etherscan_settings.optimization_used
+        );
+        mismatches.push(str);
+    }
+    if local_settings.optimizer_runs.is_some_and(|runs| etherscan_settings.runs != runs as u64)
+        || (local_settings.optimizer_runs.is_none() && etherscan_settings.runs > 0)
+    {
+        let str = format!(
+            "Optimizer runs mismatch: local={}, onchain={}",
+            local_settings.optimizer_runs.map_or("unknown".to_string(), |runs| runs.to_string()),
+            etherscan_settings.runs
+        );
+        mismatches.push(str);
+    }
+
+    mismatches
+}
+
+pub fn maybe_predeploy_contract(
+    creation_data: Result<ContractCreationData, EtherscanError>,
+) -> Result<(Option<ContractCreationData>, bool), eyre::ErrReport> {
+    let mut maybe_predeploy = false;
+    match creation_data {
+        Ok(creation_data) => Ok((Some(creation_data), maybe_predeploy)),
+        // Ref: https://explorer.mode.network/api?module=contract&action=getcontractcreation&contractaddresses=0xC0d3c0d3c0D3c0d3C0D3c0D3C0d3C0D3C0D30010
+        Err(EtherscanError::EmptyResult { status, message })
+            if status == "1" && message == "OK" =>
+        {
+            maybe_predeploy = true;
+            Ok((None, maybe_predeploy))
+        }
+        // Ref: https://api.basescan.org/api?module=contract&action=getcontractcreation&contractaddresses=0xC0d3c0d3c0D3c0d3C0D3c0D3C0d3C0D3C0D30010&apiKey=YourAPIKey
+        Err(EtherscanError::Serde { error: _, content }) if content.contains("GENESIS") => {
+            maybe_predeploy = true;
+            Ok((None, maybe_predeploy))
+        }
+        Err(e) => eyre::bail!("Error fetching creation data from verifier-url: {:?}", e),
+    }
+}
+
+pub fn check_and_encode_args(
+    artifact: &CompactContractBytecode,
+    args: Vec<String>,
+) -> Result<Vec<u8>, eyre::ErrReport> {
+    if let Some(constructor) = artifact.abi.as_ref().and_then(|abi| abi.constructor()) {
+        if constructor.inputs.len() != args.len() {
+            eyre::bail!(
+                "Mismatch of constructor arguments length. Expected {}, got {}",
+                constructor.inputs.len(),
+                args.len()
+            );
+        }
+        encode_args(&constructor.inputs, &args).map(|args| DynSolValue::Tuple(args).abi_encode())
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+pub fn check_explorer_args(source_code: ContractMetadata) -> Result<Bytes, eyre::ErrReport> {
+    if let Some(args) = source_code.items.first() {
+        Ok(args.constructor_arguments.clone())
+    } else {
+        eyre::bail!("No constructor arguments found from block explorer");
+    }
+}
+
+pub fn check_args_len(
+    artifact: &CompactContractBytecode,
+    args: &Bytes,
+) -> Result<(), eyre::ErrReport> {
+    if let Some(constructor) = artifact.abi.as_ref().and_then(|abi| abi.constructor())
+        && !constructor.inputs.is_empty()
+        && args.is_empty()
+    {
+        eyre::bail!(
+            "Contract expects {} constructor argument(s), but none were provided",
+            constructor.inputs.len()
+        );
+    }
+    Ok(())
+}
+
+pub async fn get_tracing_executor(
+    fork_config: &mut Config,
+    fork_blk_num: u64,
+    evm_version: EvmVersion,
+    evm_opts: EvmOpts,
+) -> Result<(EvmEnv, TxEnv, TracingExecutor<EthEvmNetwork>)> {
+    fork_config.fork_block_number = Some(fork_blk_num);
+    fork_config.evm_version = evm_version;
+
+    let create2_deployer = evm_opts.create2_deployer;
+    let (evm_env, tx_env, fork, _chain, networks) =
+        TracingExecutor::<EthEvmNetwork>::get_fork_material(fork_config, evm_opts).await?;
+
+    let executor = TracingExecutor::<EthEvmNetwork>::new(
+        (evm_env.clone(), tx_env.clone()),
+        fork,
+        Some(fork_config.evm_version),
+        TraceMode::Call,
+        networks,
+        create2_deployer,
+        None,
+    )?;
+
+    Ok((evm_env, tx_env, executor))
+}
+
+pub fn configure_env_block(evm_env: &mut EvmEnv, block: &AnyRpcBlock, config: NetworkConfigs) {
+    let number = evm_env.block_env.number;
+    evm_env.block_env = block_env_from_header(&block.header);
+    evm_env.block_env.number = number;
+    apply_chain_and_block_specific_env_changes::<AnyNetwork, _, _>(evm_env, block, config);
+}
+
+pub fn deploy_contract(
+    executor: &mut TracingExecutor<EthEvmNetwork>,
+    evm_env: &EvmEnv,
+    tx_env: &TxEnv,
+    spec_id: SpecId,
+    to: Option<TxKind>,
+) -> Result<Address, eyre::ErrReport> {
+    let mut evm_env = evm_env.clone();
+    evm_env.cfg_env.set_spec_and_mainnet_gas_params(spec_id);
+
+    if to.is_some_and(|to| to.is_call()) {
+        let TxKind::Call(to) = to.unwrap() else { unreachable!() };
+        if to != DEFAULT_CREATE2_DEPLOYER {
+            eyre::bail!(
+                "Transaction `to` address is not the default create2 deployer i.e the tx is not a contract creation tx."
+            );
+        }
+        let result = executor.transact_with_env(evm_env, tx_env.clone())?;
+
+        trace!(transact_result = ?result.exit_reason);
+
+        if result.reverted {
+            let decoded_reason = if result.result.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", RevertDecoder::default().decode(&result.result, result.exit_reason))
+            };
+            eyre::bail!(
+                "Failed to deploy contract via CREATE2 on fork at block{decoded_reason}.\n\
+                This typically happens when your local bytecode differs from what was actually deployed.\n\
+                Common causes:\n\
+                - Your contract source is not at the same commit used during deployment\n\
+                - Cached build artifacts are stale (try `forge clean && forge build`)\n\
+                - Compiler settings (optimizer, evm_version, via_ir) don't match the deployment"
+            );
+        }
+
+        if result.result.len() != 20 {
+            eyre::bail!(
+                "Failed to deploy contract via CREATE2 on fork at block: deployer returned {} bytes instead of 20.\n\
+                This may indicate a bytecode mismatch - ensure your source code matches the deployed contract.",
+                result.result.len()
+            );
+        }
+
+        Ok(Address::from_slice(&result.result))
+    } else {
+        let deploy_result = executor.deploy_with_env(evm_env, tx_env.clone(), None)?;
+        trace!(deploy_result = ?deploy_result.raw.exit_reason);
+        Ok(deploy_result.address)
+    }
+}
+
+pub async fn get_runtime_codes(
+    executor: &mut TracingExecutor<EthEvmNetwork>,
+    provider: &impl Provider<AnyNetwork>,
+    address: Address,
+    fork_address: Address,
+    block: Option<u64>,
+) -> Result<(Bytecode, Bytes)> {
+    let fork_runtime_code = executor
+        .backend_mut()
+        .basic(fork_address)?
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "Failed to get runtime code for contract deployed on fork at address {}",
+                fork_address
+            )
+        })?
+        .code
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "Bytecode does not exist for contract deployed on fork at address {}",
+                fork_address
+            )
+        })?;
+
+    let block_id = block.map_or_else(BlockId::latest, BlockId::number);
+    let onchain_runtime_code = provider.get_code_at(address).block_id(block_id).await?;
+
+    Ok((fork_runtime_code, onchain_runtime_code))
+}
+
+/// Returns `true` if the URL only consists of host.
+///
+/// This is used to check user input url for missing /api path
+pub fn is_host_only(url: &Url) -> bool {
+    matches!(url.path(), "/" | "")
+}
+
+/// Wraps a failed verification error with guidance when `--verifier-url` looks misconfigured for
+/// the Etherscan provider. Returns `err` untouched when no hint applies.
+///
+/// The hint only fires when the Etherscan verifier is active: it requires an API endpoint
+/// (typically `/api`). Sourcify, Blockscout, etc. accept host-only URLs, so we leave their
+/// errors alone.
+pub fn wrap_verifier_url_error(
+    err: eyre::Error,
+    verifier_url: Option<&str>,
+    using_etherscan: bool,
+) -> eyre::Error {
+    let Some(verifier_url) = verifier_url else { return err };
+    let url = match Url::parse(verifier_url) {
+        Ok(url) => url,
+        Err(url_err) => {
+            return err.wrap_err(format!("Invalid URL {verifier_url} provided: {url_err}"));
+        }
+    };
+    if is_host_only(&url) && using_etherscan {
+        return err.wrap_err(format!(
+            "Verifier `etherscan` requires an API endpoint, but `--verifier-url` is host-only: `{verifier_url}`.\n\
+             Fixes (pick one):\n\
+             - Append the API path, e.g. `--verifier-url {verifier_url}/api`\n\
+             - Switch verifier, e.g. `--verifier sourcify` (works with host-only URLs)"
+        ));
+    }
+    err
+}
+
+/// Given any solc [Version] return a [Version] with build metadata
+///
+/// # Example
+///
+/// ```ignore
+/// use semver::{BuildMetadata, Version};
+/// let version = Version::new(1, 2, 3);
+/// let version = ensure_solc_build_metadata(version).await?;
+/// assert_ne!(version.build, BuildMetadata::EMPTY);
+/// ```
+pub async fn ensure_solc_build_metadata(version: Version) -> Result<Version> {
+    if version.build == BuildMetadata::EMPTY {
+        Ok(lookup_compiler_version(&version).await?)
+    } else {
+        Ok(version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_host_only() {
+        assert!(!is_host_only(&Url::parse("https://blockscout.net/api").unwrap()));
+        assert!(is_host_only(&Url::parse("https://blockscout.net/").unwrap()));
+        assert!(is_host_only(&Url::parse("https://blockscout.net").unwrap()));
+    }
+
+    #[test]
+    fn wrap_verifier_url_error_passes_through_when_no_url() {
+        let err = eyre::eyre!("upstream failure");
+        let wrapped = wrap_verifier_url_error(err, None, true);
+        assert_eq!(wrapped.to_string(), "upstream failure");
+    }
+
+    #[test]
+    fn wrap_verifier_url_error_adds_hint_for_host_only_etherscan_url() {
+        let err = eyre::eyre!("upstream failure");
+        let wrapped = wrap_verifier_url_error(err, Some("https://contracts.tempo.xyz"), true);
+        let msg = format!("{wrapped:#}");
+        assert!(msg.contains("host-only"), "message: {msg}");
+        assert!(msg.contains("--verifier-url https://contracts.tempo.xyz/api"), "message: {msg}");
+        assert!(msg.contains("--verifier sourcify"), "message: {msg}");
+    }
+
+    /// Sourcify and other non-etherscan verifiers accept host-only URLs; we must not emit the
+    /// hint for them, otherwise we would mislead the user into editing a correct URL.
+    #[test]
+    fn wrap_verifier_url_error_does_not_hint_for_non_etherscan_provider() {
+        let err = eyre::eyre!("upstream failure");
+        let wrapped = wrap_verifier_url_error(err, Some("https://contracts.tempo.xyz"), false);
+        assert_eq!(wrapped.to_string(), "upstream failure");
+    }
+
+    #[test]
+    fn wrap_verifier_url_error_reports_invalid_url() {
+        let err = eyre::eyre!("upstream failure");
+        let wrapped = wrap_verifier_url_error(err, Some("not a url"), true);
+        let msg = format!("{wrapped:#}");
+        assert!(msg.contains("Invalid URL"), "message: {msg}");
+    }
+}

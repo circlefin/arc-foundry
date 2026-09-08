@@ -1,0 +1,358 @@
+//! CLI arguments for configuring the EVM settings.
+
+use alloy_primitives::{Address, B256, U256};
+use clap::Parser;
+use foundry_config::{
+    Chain, Config,
+    figment::{
+        self, Metadata, Profile, Provider,
+        error::Kind::InvalidType,
+        value::{Dict, Map, Value},
+    },
+};
+use foundry_evm_networks::NetworkConfigs;
+use serde::Serialize;
+
+use crate::opts::RpcCommonOpts;
+use foundry_common::shell;
+
+/// `EvmArgs` and `EnvArgs` take the highest precedence in the Config/Figment hierarchy.
+///
+/// All vars are opt-in, their default values are expected to be set by the
+/// [`foundry_config::Config`], and are always present ([`foundry_config::Config::default`])
+///
+/// Both have corresponding types in the `evm_adapters` crate which have mandatory fields.
+/// The expected workflow is
+///   1. load the [`foundry_config::Config`]
+///   2. merge with `EvmArgs` into a `figment::Figment`
+///   3. extract `evm_adapters::Opts` from the merged `Figment`
+///
+/// # Example
+///
+/// ```ignore
+/// use foundry_config::Config;
+/// use forge::executor::opts::EvmOpts;
+/// use foundry_cli::opts::EvmArgs;
+/// # fn t(args: EvmArgs) {
+/// let figment = Config::figment_with_root(".").merge(args);
+/// let opts = figment.extract::<EvmOpts>().unwrap();
+/// # }
+/// ```
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "EVM options", about = None, long_about = None)] // override doc
+pub struct EvmArgs {
+    /// Common RPC options (URL, timeout, rate limiting, etc.).
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub rpc: RpcCommonOpts,
+
+    /// Fetch state from a specific block number over a remote endpoint.
+    ///
+    /// See --rpc-url.
+    #[arg(long, requires = "rpc_url", value_name = "BLOCK")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_block_number: Option<u64>,
+
+    /// Number of retries.
+    ///
+    /// See --rpc-url.
+    #[arg(long, requires = "rpc_url", value_name = "RETRIES")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_retries: Option<u32>,
+
+    /// Initial retry backoff on encountering errors.
+    ///
+    /// See --rpc-url.
+    #[arg(long, requires = "rpc_url", value_name = "BACKOFF")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_retry_backoff: Option<u64>,
+
+    /// Explicitly disables the use of RPC caching.
+    ///
+    /// All storage slots are read entirely from the endpoint.
+    ///
+    /// This flag overrides the project's configuration file.
+    ///
+    /// See --rpc-url.
+    #[arg(long)]
+    #[serde(skip)]
+    pub no_storage_caching: bool,
+
+    /// The initial balance of deployed test contracts.
+    #[arg(long, value_name = "BALANCE")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_balance: Option<U256>,
+
+    /// The address which will be executing tests/scripts.
+    #[arg(long, value_name = "ADDRESS")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<Address>,
+
+    /// Enable the FFI cheatcode.
+    #[arg(long)]
+    #[serde(skip)]
+    pub ffi: bool,
+
+    /// Whether to show `console.log` outputs in realtime during script/test execution
+    #[arg(long)]
+    #[serde(skip)]
+    pub live_logs: bool,
+
+    /// Use the create 2 factory in all cases including tests and non-broadcasting scripts.
+    #[arg(long)]
+    #[serde(skip)]
+    pub always_use_create_2_factory: bool,
+
+    /// The CREATE2 deployer address to use, this will override the one in the config.
+    #[arg(long, value_name = "ADDRESS")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create2_deployer: Option<Address>,
+
+    /// All ethereum environment related arguments
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub env: EnvArgs,
+
+    /// Whether to enable isolation of calls.
+    /// In isolation mode all top-level calls are executed as a separate transaction in a separate
+    /// EVM context, enabling more precise gas accounting and transaction state changes.
+    #[arg(long)]
+    #[serde(skip)]
+    pub isolate: bool,
+
+    /// Network selection.
+    #[command(flatten)]
+    #[serde(skip)]
+    pub networks: NetworkConfigs,
+}
+
+// Make this set of options a `figment::Provider` so that it can be merged into the `Config`
+impl Provider for EvmArgs {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("Evm Opts Provider")
+    }
+
+    fn data(&self) -> Result<Map<Profile, Dict>, figment::Error> {
+        let value = Value::serialize(self)?;
+        let error = InvalidType(value.to_actual(), "map".into());
+        let mut dict = value.into_dict().ok_or(error)?;
+
+        if shell::verbosity() > 0 {
+            // need to merge that manually otherwise `from_occurrences` does not work
+            dict.insert("verbosity".to_string(), shell::verbosity().into());
+        }
+
+        if self.ffi {
+            dict.insert("ffi".to_string(), self.ffi.into());
+        }
+
+        if self.live_logs {
+            dict.insert("live_logs".to_string(), self.live_logs.into());
+        }
+
+        if self.isolate {
+            dict.insert("isolate".to_string(), self.isolate.into());
+        }
+
+        if self.always_use_create_2_factory {
+            dict.insert(
+                "always_use_create_2_factory".to_string(),
+                self.always_use_create_2_factory.into(),
+            );
+        }
+
+        if self.no_storage_caching {
+            dict.insert("no_storage_caching".to_string(), self.no_storage_caching.into());
+        }
+
+        // Merge serde-skipped fields from the common RPC options.
+        if self.rpc.no_rpc_rate_limit {
+            dict.insert("no_rpc_rate_limit".to_string(), true.into());
+        }
+        if self.rpc.accept_invalid_certs {
+            dict.insert("eth_rpc_accept_invalid_certs".to_string(), true.into());
+        }
+        if self.rpc.no_proxy {
+            dict.insert("eth_rpc_no_proxy".to_string(), true.into());
+        }
+
+        // Only insert network flags when explicitly set via CLI to avoid overriding
+        // values from foundry.toml (NetworkConfigs is flattened in Config).
+        if let Some(name) = self.networks.active_network_name() {
+            dict.insert("network".to_string(), name.into());
+        }
+        if self.networks.is_celo() {
+            dict.insert("celo".to_string(), true.into());
+        }
+
+        Ok(Map::from([(Config::selected_profile(), dict)]))
+    }
+}
+
+/// Configures the executor environment during tests.
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "Executor environment config")]
+pub struct EnvArgs {
+    /// EIP-170: Contract code size limit in bytes. Useful to increase this because of tests. By
+    /// default, it is 0x6000 (~25kb).
+    #[arg(long, value_name = "CODE_SIZE")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_size_limit: Option<usize>,
+
+    /// The chain name or EIP-155 chain ID.
+    #[arg(long, visible_alias = "chain-id", value_name = "CHAIN")]
+    #[serde(rename = "chain_id", skip_serializing_if = "Option::is_none", serialize_with = "id")]
+    pub chain: Option<Chain>,
+
+    /// The gas price.
+    #[arg(long, value_name = "GAS_PRICE")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_price: Option<u64>,
+
+    /// The base fee in a block.
+    #[arg(long, visible_alias = "base-fee", value_name = "FEE")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_base_fee_per_gas: Option<u64>,
+
+    /// The transaction origin.
+    #[arg(long, value_name = "ADDRESS")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_origin: Option<Address>,
+
+    /// The coinbase of the block.
+    #[arg(long, value_name = "ADDRESS")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_coinbase: Option<Address>,
+
+    /// The timestamp of the block.
+    #[arg(long, value_name = "TIMESTAMP")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_timestamp: Option<u64>,
+
+    /// The block number.
+    #[arg(long, value_name = "BLOCK")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+
+    /// The block difficulty.
+    #[arg(long, value_name = "DIFFICULTY")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_difficulty: Option<u64>,
+
+    /// The block prevrandao value. NOTE: Before merge this field was mix_hash.
+    #[arg(long, value_name = "PREVRANDAO")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_prevrandao: Option<B256>,
+
+    /// The block gas limit.
+    #[arg(long, visible_alias = "gas-limit", value_name = "BLOCK_GAS_LIMIT")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_gas_limit: Option<u64>,
+
+    /// The memory limit per EVM execution in bytes.
+    /// If this limit is exceeded, a `MemoryLimitOOG` result is thrown.
+    ///
+    /// The default is 128MiB.
+    #[arg(long, value_name = "MEMORY_LIMIT")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit: Option<u64>,
+
+    /// Whether to disable the block gas limit checks.
+    #[arg(long, visible_aliases = &["no-block-gas-limit", "no-gas-limit"])]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disable_block_gas_limit: bool,
+
+    /// Whether to enable tx gas limit checks as imposed by Osaka (EIP-7825).
+    #[arg(long, visible_alias = "tx-gas-limit")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enable_tx_gas_limit: bool,
+}
+
+/// We have to serialize chain IDs and not names because when extracting an EVM `Env`, it expects
+/// `chain_id` to be `u64`.
+fn id<S: serde::Serializer>(chain: &Option<Chain>, s: S) -> Result<S::Ok, S::Error> {
+    if let Some(chain) = chain {
+        s.serialize_u64(chain.id())
+    } else {
+        // skip_serializing_if = "Option::is_none" should prevent this branch from being taken
+        unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foundry_config::NamedChain;
+
+    #[test]
+    fn compute_units_per_second_skips_when_none() {
+        let args = EvmArgs::default();
+        let data = args.data().expect("provider data");
+        let dict = data.get(&Config::selected_profile()).expect("profile dict");
+        assert!(
+            !dict.contains_key("compute_units_per_second"),
+            "compute_units_per_second should be skipped when None"
+        );
+    }
+
+    #[test]
+    fn compute_units_per_second_present_when_some() {
+        let args = EvmArgs {
+            rpc: RpcCommonOpts { compute_units_per_second: Some(1000), ..Default::default() },
+            ..Default::default()
+        };
+        let data = args.data().expect("provider data");
+        let dict = data.get(&Config::selected_profile()).expect("profile dict");
+        let val = dict.get("compute_units_per_second").expect("cups present");
+        assert_eq!(val, &Value::from(1000u64));
+    }
+
+    #[test]
+    fn rpc_url_arg_does_not_read_eth_rpc_url_env() {
+        use clap::CommandFactory;
+
+        let command = EvmArgs::command();
+        let rpc_url =
+            command.get_arguments().find(|arg| arg.get_id() == "rpc_url").expect("rpc_url arg");
+
+        assert!(rpc_url.get_env().is_none());
+    }
+
+    #[test]
+    fn can_parse_chain_id() {
+        let args = EvmArgs {
+            env: EnvArgs { chain: Some(NamedChain::Mainnet.into()), ..Default::default() },
+            ..Default::default()
+        };
+        let config = Config::from_provider(Config::figment().merge(args)).unwrap();
+        assert_eq!(config.chain, Some(NamedChain::Mainnet.into()));
+
+        let env = EnvArgs::parse_from(["foundry-cli", "--chain-id", "goerli"]);
+        assert_eq!(env.chain, Some(NamedChain::Goerli.into()));
+    }
+
+    #[test]
+    fn test_memory_limit() {
+        let args = EvmArgs {
+            env: EnvArgs { chain: Some(NamedChain::Mainnet.into()), ..Default::default() },
+            ..Default::default()
+        };
+        let config = Config::from_provider(Config::figment().merge(args)).unwrap();
+        assert_eq!(config.memory_limit, Config::default().memory_limit);
+
+        let env = EnvArgs::parse_from(["foundry-cli", "--memory-limit", "100"]);
+        assert_eq!(env.memory_limit, Some(100));
+    }
+
+    #[test]
+    fn test_chain_id() {
+        let env = EnvArgs::parse_from(["foundry-cli", "--chain-id", "1"]);
+        assert_eq!(env.chain, Some(Chain::mainnet()));
+
+        let env = EnvArgs::parse_from(["foundry-cli", "--chain-id", "mainnet"]);
+        assert_eq!(env.chain, Some(Chain::mainnet()));
+        let args = EvmArgs { env, ..Default::default() };
+        let config = Config::from_provider(Config::figment().merge(args)).unwrap();
+        assert_eq!(config.chain, Some(Chain::mainnet()));
+    }
+}

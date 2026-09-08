@@ -1,0 +1,13 @@
+[package]
+name = "ctutils"
+version = "0.3.2"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[features]
+alloc = ["ctutils-v4/alloc"]
+subtle = ["ctutils-v4/subtle"]
+
+[dependencies]
+ctutils-v4 = { package = "ctutils", version = "=0.4.2", default-features = false }

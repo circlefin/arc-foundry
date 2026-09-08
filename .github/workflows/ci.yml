@@ -1,0 +1,40 @@
+# Minimal public CI for circlefin/arc-foundry.
+#
+# This file belongs on the release/public branch (and thus arc-foundry) at
+# .github/workflows/ci.yml.
+#
+# Deliberately minimal (fmt + check) so it is green from day one. Expand into a
+# full build/test matrix once the public repo is established.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      # rust-toolchain.toml pins the exact toolchain and components.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Check
+        run: cargo check --workspace

@@ -1,0 +1,38 @@
+NOTICE
+======
+
+This project is a fork of Foundry (https://github.com/foundry-rs/foundry),
+a portable and modular toolkit for Ethereum application development.
+
+Foundry is dual-licensed under either of:
+
+  * Apache License, Version 2.0 (see LICENSE-APACHE), and
+  * MIT license (see LICENSE-MIT),
+
+at your option.
+
+--------------------------------------------------------------------------------
+Original work
+--------------------------------------------------------------------------------
+
+Copyright (c) 2021 Georgios Konstantopoulos and the Foundry Contributors.
+
+The original Foundry source code is licensed under MIT OR Apache-2.0. All
+original copyright, license, and attribution notices are retained. See
+LICENSE-APACHE and LICENSE-MIT for the full license texts.
+
+--------------------------------------------------------------------------------
+Modifications
+--------------------------------------------------------------------------------
+
+Modifications Copyright (c) 2026, Circle Internet Group, Inc. All rights reserved.
+
+Circle's modifications to the original Foundry source, and any new files
+authored by Circle, are licensed under the same terms (MIT OR Apache-2.0).
+The specific changes made by Circle are recorded in this repository's Git
+history.
+
+This distribution also incorporates third-party open source components. See
+the accompanying Software Bill of Materials (sbom.spdx.json) and license
+inventory (licenses.csv) for the complete list of dependencies and their
+licenses.

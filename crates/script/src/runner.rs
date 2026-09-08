@@ -1,0 +1,429 @@
+use super::{ScriptConfig, ScriptResult};
+use crate::build::ScriptPredeployLibraries;
+use alloy_eips::eip7702::SignedAuthorization;
+use alloy_evm::revm::context::Transaction;
+use alloy_network::TransactionBuilder;
+use alloy_primitives::{Address, Bytes, U256};
+use eyre::Result;
+use foundry_cheatcodes::BroadcastableTransaction;
+use foundry_common::TransactionMaybeSigned;
+use foundry_config::Config;
+use foundry_evm::{
+    constants::CALLER,
+    core::{
+        FoundryTransaction,
+        evm::{FoundryEvmNetwork, TransactionRequestFor},
+    },
+    executors::{DeployResult, EvmError, ExecutionErr, Executor, RawCallResult},
+    opts::EvmOpts,
+    revm::interpreter::{InstructionResult, return_ok},
+    traces::{TraceKind, Traces},
+};
+use std::collections::VecDeque;
+
+/// Drives script execution
+#[derive(Debug)]
+pub struct ScriptRunner<FEN: FoundryEvmNetwork> {
+    pub executor: Executor<FEN>,
+    pub evm_opts: EvmOpts,
+}
+
+impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
+    pub const fn new(executor: Executor<FEN>, evm_opts: EvmOpts) -> Self {
+        Self { executor, evm_opts }
+    }
+
+    /// Deploys the libraries and broadcast contract. Calls setUp method if requested.
+    pub fn setup(
+        &mut self,
+        libraries: &ScriptPredeployLibraries,
+        code: Bytes,
+        setup: bool,
+        script_config: &ScriptConfig<FEN>,
+        is_broadcast: bool,
+    ) -> Result<(Address, ScriptResult<FEN::Network>)> {
+        trace!(target: "script", "executing setUP()");
+
+        if !is_broadcast {
+            if self.evm_opts.sender == Config::DEFAULT_SENDER {
+                // We max out their balance so that they can deploy and make calls.
+                self.executor.set_balance(self.evm_opts.sender, U256::MAX)?;
+            }
+
+            if script_config.evm_opts.fork_url.is_none()
+                && !script_config.evm_opts.networks.is_tempo()
+            {
+                self.executor.deploy_create2_deployer()?;
+            }
+        }
+
+        let sender_nonce = script_config.sender_nonce;
+        self.executor.set_nonce(self.evm_opts.sender, sender_nonce)?;
+
+        // We max out their balance so that they can deploy and make calls.
+        self.executor.set_balance(CALLER, U256::MAX)?;
+
+        let mut library_transactions = VecDeque::new();
+        let mut traces = Traces::default();
+
+        // Deploy libraries
+        match libraries {
+            ScriptPredeployLibraries::Default(libraries) => libraries.iter().for_each(|code| {
+                let result = self
+                    .executor
+                    .deploy(self.evm_opts.sender, code.clone(), U256::ZERO, None)
+                    .expect("couldn't deploy library")
+                    .raw;
+
+                if let Some(deploy_traces) = result.traces {
+                    traces.push((TraceKind::Deployment, deploy_traces));
+                }
+
+                let mut tx_req = TransactionRequestFor::<FEN>::default()
+                    .with_from(self.evm_opts.sender)
+                    .with_input(code.clone())
+                    .with_nonce(sender_nonce + library_transactions.len() as u64);
+
+                script_config.tempo.apply::<FEN::Network>(&mut tx_req, None);
+
+                library_transactions.push_back(BroadcastableTransaction {
+                    rpc: self.evm_opts.fork_url.clone(),
+                    transaction: TransactionMaybeSigned::new(tx_req),
+                })
+            }),
+            ScriptPredeployLibraries::Create2(libraries, salt) => {
+                let create2_deployer = self.executor.create2_deployer();
+                for library in libraries {
+                    let address = create2_deployer.create2_from_code(salt, library.as_ref());
+                    // Skip if already deployed
+                    if !self.executor.is_empty_code(address)? {
+                        continue;
+                    }
+                    let calldata = [salt.as_ref(), library.as_ref()].concat();
+                    let result = self
+                        .executor
+                        .transact_raw(
+                            self.evm_opts.sender,
+                            create2_deployer,
+                            calldata.clone().into(),
+                            U256::from(0),
+                        )
+                        .expect("couldn't deploy library");
+
+                    if let Some(deploy_traces) = result.traces {
+                        traces.push((TraceKind::Deployment, deploy_traces));
+                    }
+
+                    let mut tx_req = TransactionRequestFor::<FEN>::default()
+                        .with_from(self.evm_opts.sender)
+                        .with_input(calldata)
+                        .with_nonce(sender_nonce + library_transactions.len() as u64)
+                        .with_to(create2_deployer);
+
+                    script_config.tempo.apply::<FEN::Network>(&mut tx_req, None);
+
+                    library_transactions.push_back(BroadcastableTransaction {
+                        rpc: self.evm_opts.fork_url.clone(),
+                        transaction: TransactionMaybeSigned::new(tx_req),
+                    });
+                }
+
+                // Sender nonce is not incremented when performing CALLs. We need to manually
+                // increase it.
+                self.executor.set_nonce(
+                    self.evm_opts.sender,
+                    sender_nonce + library_transactions.len() as u64,
+                )?;
+            }
+        };
+
+        let address = CALLER.create(self.executor.get_nonce(CALLER)?);
+
+        // Set the contracts initial balance before deployment, so it is available during the
+        // construction
+        self.executor.set_balance(address, self.evm_opts.initial_balance)?;
+
+        // HACK: if the current sender is the default script sender (which is a default value), we
+        // set its nonce to a very large value before deploying the script contract. This
+        // ensures that the nonce increase during this CREATE does not affect deployment
+        // addresses of contracts that are deployed in the script, Otherwise, we'd have a
+        // nonce mismatch during script execution and onchain simulation, potentially
+        // resulting in weird errors like <https://github.com/foundry-rs/foundry/issues/8960>.
+        let prev_sender_nonce = self.executor.get_nonce(self.evm_opts.sender)?;
+        if self.evm_opts.sender == CALLER {
+            self.executor.set_nonce(self.evm_opts.sender, u64::MAX / 2)?;
+        }
+
+        // Deploy an instance of the contract
+        let DeployResult {
+            address,
+            raw: RawCallResult { mut logs, traces: constructor_traces, .. },
+        } = self
+            .executor
+            .deploy(CALLER, code, U256::ZERO, None)
+            .map_err(|err| eyre::eyre!("Failed to deploy script:\n{}", err))?;
+
+        if self.evm_opts.sender == CALLER {
+            self.executor.set_nonce(self.evm_opts.sender, prev_sender_nonce)?;
+        }
+
+        // set script address to be used by execution inspector
+        if script_config.config.script_execution_protection {
+            self.executor.set_script_execution(address);
+        }
+
+        traces.extend(constructor_traces.map(|traces| (TraceKind::Deployment, traces)));
+
+        // Optionally call the `setUp` function
+        let (success, gas_used, labeled_addresses, transactions) = if setup {
+            match self.executor.setup(Some(self.evm_opts.sender), address, None) {
+                Ok(RawCallResult {
+                    reverted,
+                    traces: setup_traces,
+                    labels,
+                    logs: setup_logs,
+                    gas_used,
+                    transactions: setup_transactions,
+                    ..
+                }) => {
+                    traces.extend(setup_traces.map(|traces| (TraceKind::Setup, traces)));
+                    logs.extend_from_slice(&setup_logs);
+
+                    if let Some(txs) = setup_transactions {
+                        library_transactions.extend(txs);
+                    }
+
+                    (!reverted, gas_used, labels, Some(library_transactions))
+                }
+                Err(EvmError::Execution(err)) => {
+                    let RawCallResult {
+                        reverted,
+                        traces: setup_traces,
+                        labels,
+                        logs: setup_logs,
+                        gas_used,
+                        transactions,
+                        ..
+                    } = err.raw;
+                    traces.extend(setup_traces.map(|traces| (TraceKind::Setup, traces)));
+                    logs.extend_from_slice(&setup_logs);
+
+                    if let Some(txs) = transactions {
+                        library_transactions.extend(txs);
+                    }
+
+                    (!reverted, gas_used, labels, Some(library_transactions))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            self.executor.backend_mut().set_test_contract(address);
+            (true, 0, Default::default(), Some(library_transactions))
+        };
+
+        Ok((
+            address,
+            ScriptResult {
+                returned: Bytes::new(),
+                success,
+                gas_used,
+                labeled_addresses,
+                transactions,
+                logs,
+                traces,
+                address: None,
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// Executes the method that will collect all broadcastable transactions.
+    pub fn script(
+        &mut self,
+        address: Address,
+        calldata: Bytes,
+    ) -> Result<ScriptResult<FEN::Network>> {
+        self.call(self.evm_opts.sender, address, calldata, U256::ZERO, None, false)
+    }
+
+    /// Runs a broadcastable transaction locally and persists its state.
+    pub fn simulate(
+        &mut self,
+        from: Address,
+        to: Option<Address>,
+        calldata: Option<Bytes>,
+        value: Option<U256>,
+        authorization_list: Option<Vec<SignedAuthorization>>,
+    ) -> Result<ScriptResult<FEN::Network>> {
+        if let Some(to) = to {
+            self.call(
+                from,
+                to,
+                calldata.unwrap_or_default(),
+                value.unwrap_or(U256::ZERO),
+                authorization_list,
+                true,
+            )
+        } else {
+            let res = self.executor.deploy(
+                from,
+                calldata.expect("No data for create transaction"),
+                value.unwrap_or(U256::ZERO),
+                None,
+            );
+            let (address, RawCallResult { gas_used, logs, traces, exit_reason, .. }) = match res {
+                Ok(DeployResult { address, raw }) => (address, raw),
+                Err(EvmError::Execution(err)) => {
+                    let ExecutionErr { raw, reason } = *err;
+                    sh_err!("Failed with `{reason}`:\n")?;
+                    (Address::ZERO, raw)
+                }
+                Err(e) => eyre::bail!("Failed deploying contract: {e:?}"),
+            };
+
+            Ok(ScriptResult {
+                returned: Bytes::new(),
+                success: address != Address::ZERO,
+                gas_used,
+                logs,
+                // Manually adjust gas for the trace to add back the stipend/real used gas
+                traces: traces
+                    .map(|traces| vec![(TraceKind::Execution, traces)])
+                    .unwrap_or_default(),
+                exit_reason,
+                address: Some(address),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Executes the call
+    ///
+    /// This will commit the changes if `commit` is true.
+    ///
+    /// This will return _estimated_ gas instead of the precise gas the call would consume, so it
+    /// can be used as `gas_limit`.
+    fn call(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        value: U256,
+        authorization_list: Option<Vec<SignedAuthorization>>,
+        commit: bool,
+    ) -> Result<ScriptResult<FEN::Network>> {
+        let mut res = if let Some(authorization_list) = &authorization_list {
+            self.executor.call_raw_with_authorization(
+                from,
+                to,
+                calldata.clone(),
+                value,
+                authorization_list.clone(),
+            )?
+        } else {
+            self.executor.call_raw(from, to, calldata.clone(), value)?
+        };
+        let mut gas_used = res.gas_used;
+
+        // We should only need to calculate realistic gas costs when preparing to broadcast
+        // something. This happens during the onchain simulation stage, where we commit each
+        // collected transactions.
+        //
+        // Otherwise don't re-execute, or some usecases might be broken: https://github.com/foundry-rs/foundry/issues/3921
+        if commit {
+            gas_used = self.search_optimal_gas_usage(&res, from, to, &calldata, value)?;
+            res = if let Some(authorization_list) = authorization_list {
+                self.executor.transact_raw_with_authorization(
+                    from,
+                    to,
+                    calldata,
+                    value,
+                    authorization_list,
+                )?
+            } else {
+                self.executor.transact_raw(from, to, calldata, value)?
+            }
+        }
+
+        let RawCallResult {
+            result, reverted, logs, traces, labels, transactions, exit_reason, ..
+        } = res;
+        let breakpoints = res.cheatcodes.map(|cheats| cheats.breakpoints).unwrap_or_default();
+
+        Ok(ScriptResult {
+            returned: result,
+            success: !reverted,
+            gas_used,
+            logs,
+            traces: traces
+                .map(|traces| {
+                    // Manually adjust gas for the trace to add back the stipend/real used gas
+
+                    vec![(TraceKind::Execution, traces)]
+                })
+                .unwrap_or_default(),
+            labeled_addresses: labels,
+            transactions,
+            exit_reason,
+            address: None,
+            breakpoints,
+        })
+    }
+
+    /// The executor will return the _exact_ gas value this transaction consumed, setting this value
+    /// as gas limit will result in `OutOfGas` so to come up with a better estimate we search over a
+    /// possible range we pick a higher gas limit 3x of a succeeded call should be safe.
+    ///
+    /// This might result in executing the same script multiple times. Depending on the user's goal,
+    /// it might be problematic when using `ffi`.
+    fn search_optimal_gas_usage(
+        &mut self,
+        res: &RawCallResult<FEN>,
+        from: Address,
+        to: Address,
+        calldata: &Bytes,
+        value: U256,
+    ) -> Result<u64> {
+        let mut gas_used = res.gas_used;
+        if matches!(res.exit_reason, Some(return_ok!())) {
+            // Store the current gas limit and reset it later.
+            let init_gas_limit = self.executor.tx_env().gas_limit();
+
+            let mut highest_gas_limit = gas_used * 3;
+            let mut lowest_gas_limit = gas_used;
+            let mut last_highest_gas_limit = highest_gas_limit;
+            while (highest_gas_limit - lowest_gas_limit) > 1 {
+                let mid_gas_limit = (highest_gas_limit + lowest_gas_limit) / 2;
+                self.executor.tx_env_mut().set_gas_limit(mid_gas_limit);
+                let res = self.executor.call_raw(from, to, calldata.0.clone().into(), value)?;
+                match res.exit_reason {
+                    Some(
+                        InstructionResult::Revert
+                        | InstructionResult::OutOfGas
+                        | InstructionResult::OutOfFunds,
+                    ) => {
+                        lowest_gas_limit = mid_gas_limit;
+                    }
+                    _ => {
+                        highest_gas_limit = mid_gas_limit;
+                        // if last two successful estimations only vary by 10%, we consider this to
+                        // sufficiently accurate
+                        const ACCURACY: u64 = 10;
+                        if (last_highest_gas_limit - highest_gas_limit) * ACCURACY
+                            / last_highest_gas_limit
+                            < 1
+                        {
+                            // update the gas
+                            gas_used = highest_gas_limit;
+                            break;
+                        }
+                        last_highest_gas_limit = highest_gas_limit;
+                    }
+                }
+            }
+            // Reset gas limit in the executor.
+            self.executor.tx_env_mut().set_gas_limit(init_gas_limit);
+        }
+        Ok(gas_used)
+    }
+}
