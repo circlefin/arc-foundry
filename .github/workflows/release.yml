@@ -1,0 +1,77 @@
+# Public release for circlefin/arc-foundry.
+#
+# This file belongs on the release/public branch (and thus arc-foundry) at
+# .github/workflows/release.yml. It builds the Arc Foundry binaries for each
+# supported platform and attaches them to a GitHub Release.
+#
+# Every target builds natively on a runner of the matching architecture, so there
+# is no cross-compilation. Chisel is not yet supported on Arc and is not shipped.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release.
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: github-hosted-2xlarge
+          - target: aarch64-apple-darwin
+            runner: github-hosted-mac-xlarge
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          out="arc-foundry-${TAG}-${TARGET}.tar.gz"
+          tar -czf "$out" -C target/release forge cast anvil
+          shasum -a 256 "$out" > "$out.sha256"
+          echo "artifact=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.artifact }}
+            ${{ steps.package.outputs.artifact }}.sha256

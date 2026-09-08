@@ -1,0 +1,1188 @@
+use crate::{
+    AccountGenerator, CHAIN_ID, NodeConfig,
+    config::{DEFAULT_MNEMONIC, ForkChoice},
+    eth::{EthApi, backend::db::SerializableState, pool::transactions::TransactionOrder},
+};
+use alloy_genesis::Genesis;
+use alloy_network::Network;
+use alloy_primitives::{B256, U256, utils::Unit};
+use alloy_signer_local::coins_bip39::{English, Mnemonic};
+use anvil_server::ServerConfig;
+use clap::Parser;
+use core::fmt;
+use foundry_common::shell;
+use foundry_config::{Chain, Config, FigmentProviders};
+#[cfg(feature = "optimism")]
+use foundry_evm::hardfork::OpHardfork;
+use foundry_evm::hardfork::{EthereumHardfork, FoundryHardfork};
+use foundry_evm_networks::NetworkConfigs;
+use foundry_primitives::FoundryReceiptEnvelope;
+use futures::FutureExt;
+use rand_08::{SeedableRng, rngs::StdRng};
+use std::{
+    net::IpAddr,
+    path::{Path, PathBuf},
+    pin::Pin,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+use tempo_chainspec::hardfork::TempoHardfork;
+use tokio::time::{Instant, Interval};
+
+#[derive(Clone, Debug, Parser)]
+pub struct NodeArgs {
+    /// Port number to listen on.
+    #[arg(long, short, default_value = "8545", value_name = "NUM")]
+    pub port: u16,
+
+    /// Number of dev accounts to generate and configure.
+    #[arg(long, short, default_value = "10", value_name = "NUM")]
+    pub accounts: u64,
+
+    /// The balance of every dev account in Ether.
+    #[arg(long, default_value = "10000", value_name = "NUM")]
+    pub balance: u64,
+
+    /// The timestamp of the genesis block.
+    #[arg(long, value_name = "NUM")]
+    pub timestamp: Option<u64>,
+
+    /// The number of the genesis block.
+    #[arg(long, value_name = "NUM")]
+    pub number: Option<u64>,
+
+    /// BIP39 mnemonic phrase used for generating accounts.
+    /// Cannot be used if `mnemonic_random` or `mnemonic_seed` are used.
+    #[arg(long, short, conflicts_with_all = &["mnemonic_seed", "mnemonic_random"])]
+    pub mnemonic: Option<String>,
+
+    /// Automatically generates a BIP39 mnemonic phrase, and derives accounts from it.
+    /// Cannot be used with other `mnemonic` options.
+    /// You can specify the number of words you want in the mnemonic.
+    /// [default: 12]
+    #[arg(long, conflicts_with_all = &["mnemonic", "mnemonic_seed"], default_missing_value = "12", num_args(0..=1))]
+    pub mnemonic_random: Option<usize>,
+
+    /// Generates a BIP39 mnemonic phrase from a given seed
+    /// Cannot be used with other `mnemonic` options.
+    ///
+    /// CAREFUL: This is NOT SAFE and should only be used for testing.
+    /// Never use the private keys generated in production.
+    #[arg(long = "mnemonic-seed-unsafe", conflicts_with_all = &["mnemonic", "mnemonic_random"])]
+    pub mnemonic_seed: Option<u64>,
+
+    /// Sets the derivation path of the child key to be derived.
+    ///
+    /// [default: m/44'/60'/0'/0/]
+    #[arg(long)]
+    pub derivation_path: Option<String>,
+
+    /// The EVM hardfork to use.
+    ///
+    /// Choose the hardfork by name, e.g. `prague`, `cancun`, `shanghai`, `paris`, `london`, etc...
+    /// [default: latest]
+    #[arg(long)]
+    pub hardfork: Option<String>,
+
+    /// Block time in seconds for interval mining.
+    #[arg(short, long, visible_alias = "blockTime", value_name = "SECONDS", value_parser = duration_from_secs_f64)]
+    pub block_time: Option<Duration>,
+
+    /// Slots in an epoch
+    #[arg(long, value_name = "SLOTS_IN_AN_EPOCH", default_value_t = 32)]
+    pub slots_in_an_epoch: u64,
+
+    /// Writes output of `anvil` as json to user-specified file.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub config_out: Option<PathBuf>,
+
+    /// Disable auto and interval mining, and mine on demand instead.
+    #[arg(long, visible_alias = "no-mine", conflicts_with = "block_time")]
+    pub no_mining: bool,
+
+    #[arg(long, requires = "block_time")]
+    pub mixed_mining: bool,
+
+    /// The hosts the server will listen on.
+    #[arg(
+        long,
+        value_name = "IP_ADDR",
+        env = "ANVIL_IP_ADDR",
+        default_value = "127.0.0.1",
+        help_heading = "Server options",
+        value_delimiter = ','
+    )]
+    pub host: Vec<IpAddr>,
+
+    /// How transactions are sorted in the mempool.
+    #[arg(long, default_value = "fees")]
+    pub order: TransactionOrder,
+
+    /// Initialize the genesis block with the given `genesis.json` file.
+    #[arg(long, value_name = "PATH", value_parser= read_genesis_file)]
+    pub init: Option<Genesis>,
+
+    /// This is an alias for both --load-state and --dump-state.
+    ///
+    /// It initializes the chain with the state and block environment stored at the file, if it
+    /// exists, and dumps the chain's state on exit.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = StateFile::parse,
+        conflicts_with_all = &[
+            "init",
+            "dump_state",
+            "load_state"
+        ]
+    )]
+    pub state: Option<StateFile>,
+
+    /// Interval in seconds at which the state and block environment is to be dumped to disk.
+    ///
+    /// See --state and --dump-state
+    #[arg(short, long, value_name = "SECONDS")]
+    pub state_interval: Option<u64>,
+
+    /// Dump the state and block environment of chain on exit to the given file.
+    ///
+    /// If the value is a directory, the state will be written to `<VALUE>/state.json`.
+    #[arg(long, value_name = "PATH", conflicts_with = "init")]
+    pub dump_state: Option<PathBuf>,
+
+    /// Preserve historical state snapshots when dumping the state.
+    ///
+    /// This will save the in-memory states of the chain at particular block hashes.
+    ///
+    /// These historical states will be loaded into the memory when `--load-state` / `--state`, and
+    /// aids in RPC calls beyond the block at which state was dumped.
+    #[arg(long, conflicts_with = "init", default_value = "false")]
+    pub preserve_historical_states: bool,
+
+    /// Initialize the chain from a previously saved state snapshot.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = SerializableState::parse,
+        conflicts_with = "init"
+    )]
+    pub load_state: Option<SerializableState>,
+
+    #[arg(long, help = IPC_HELP, value_name = "PATH", visible_alias = "ipcpath")]
+    pub ipc: Option<Option<String>>,
+
+    /// Don't keep full chain history.
+    /// If a number argument is specified, at most this number of states is kept in memory.
+    ///
+    /// If enabled, no state will be persisted on disk, so `max_persisted_states` will be 0.
+    #[arg(long)]
+    pub prune_history: Option<Option<usize>>,
+
+    /// Max number of states to persist on disk.
+    ///
+    /// Note that `prune_history` will overwrite `max_persisted_states` to 0.
+    #[arg(long, conflicts_with = "prune_history")]
+    pub max_persisted_states: Option<usize>,
+
+    /// Number of blocks with transactions to keep in memory.
+    #[arg(long)]
+    pub transaction_block_keeper: Option<usize>,
+
+    /// Maximum number of transactions in a block.
+    #[arg(long)]
+    pub max_transactions: Option<usize>,
+
+    #[command(flatten)]
+    pub evm: AnvilEvmArgs,
+
+    #[command(flatten)]
+    pub server_config: ServerConfig,
+
+    /// Path to the cache directory where persisted states are stored (see
+    /// `--max-persisted-states`).
+    ///
+    /// Note: This does not affect the fork RPC cache location (`storage.json`), which is stored in
+    /// `~/.foundry/cache/rpc/<chain>/<block>/`.
+    #[arg(long, value_name = "PATH")]
+    pub cache_path: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+const IPC_HELP: &str =
+    "Launch an ipc server at the given path or default path = `\\.\\pipe\\anvil.ipc`";
+
+/// The default IPC endpoint
+#[cfg(not(windows))]
+const IPC_HELP: &str = "Launch an ipc server at the given path or default path = `/tmp/anvil.ipc`";
+
+/// Default interval for periodically dumping the state.
+const DEFAULT_DUMP_INTERVAL: Duration = Duration::from_secs(60);
+
+impl NodeArgs {
+    pub fn into_node_config(mut self) -> eyre::Result<NodeConfig> {
+        let genesis_balance = Unit::ETHER.wei().saturating_mul(U256::from(self.balance));
+        let compute_units_per_second =
+            if self.evm.no_rate_limit { Some(u64::MAX) } else { self.evm.compute_units_per_second };
+
+        // Validate that secondary fork URLs don't have conflicting block number suffixes
+        if self.evm.fork_url.len() > 1 {
+            for fork in &self.evm.fork_url[1..] {
+                if fork.block.is_some() {
+                    eyre::bail!(
+                        "Block number suffixes (@block) on secondary --fork-url values are not supported. \
+                         Use --fork-block-number to set the fork block for all endpoints."
+                    );
+                }
+            }
+        }
+
+        let hardfork = match &self.hardfork {
+            Some(hf) => {
+                let hardfork = parse_hardfork(hf, &self.evm.networks)?;
+                // The Arc EVM factory reads the selection from `networks`, not from `hardfork`.
+                if let FoundryHardfork::Arc(arc_hardfork) = hardfork {
+                    self.evm.networks = self.evm.networks.with_arc_hardfork(arc_hardfork);
+                }
+                Some(hardfork)
+            }
+            None if self.evm.networks.is_arc() && self.evm.fork_url.is_empty() => {
+                let hardfork = foundry_evm::hardfork::default_local_arc_hardfork();
+                self.evm.networks = self.evm.networks.with_arc_hardfork(hardfork);
+                Some(hardfork.into())
+            }
+            None => None,
+        };
+
+        Ok(NodeConfig::default()
+            .with_gas_limit(self.evm.gas_limit)
+            .disable_block_gas_limit(self.evm.disable_block_gas_limit)
+            .enable_tx_gas_limit(self.evm.enable_tx_gas_limit)
+            .with_gas_price(self.evm.gas_price)
+            .with_hardfork(hardfork)
+            .with_blocktime(self.block_time)
+            .with_no_mining(self.no_mining)
+            .with_mixed_mining(self.mixed_mining, self.block_time)
+            .with_account_generator(self.account_generator())?
+            .with_genesis_balance(genesis_balance)
+            .with_genesis_timestamp(self.timestamp)
+            .with_genesis_block_number(self.number)
+            .with_port(self.port)
+            .with_fork_choice(match (self.evm.fork_block_number, self.evm.fork_transaction_hash) {
+                (Some(block), None) => Some(ForkChoice::Block(block)),
+                (None, Some(hash)) => Some(ForkChoice::Transaction(hash)),
+                _ => self
+                    .evm
+                    .fork_url
+                    .first()
+                    .and_then(|f| f.block)
+                    .map(|num| ForkChoice::Block(num as i128)),
+            })
+            .with_fork_headers(self.evm.fork_headers)
+            .with_fork_chain_id(self.evm.fork_chain_id.map(u64::from).map(U256::from))
+            .fork_request_timeout(self.evm.fork_request_timeout.map(Duration::from_millis))
+            .fork_request_retries(self.evm.fork_request_retries)
+            .fork_retry_backoff(self.evm.fork_retry_backoff.map(Duration::from_millis))
+            .fork_compute_units_per_second(compute_units_per_second)
+            .with_fork_urls(self.evm.fork_url.into_iter().map(|f| f.url).collect())
+            .with_base_fee(self.evm.block_base_fee_per_gas)
+            .disable_min_priority_fee(self.evm.disable_min_priority_fee)
+            .with_no_storage_caching(self.evm.no_storage_caching)
+            .with_server_config(self.server_config)
+            .with_host(self.host)
+            .set_silent(shell::is_quiet())
+            .set_config_out(self.config_out)
+            .with_networks(self.evm.networks)
+            .with_chain_id(self.evm.chain_id)
+            .with_transaction_order(self.order)
+            .with_genesis(self.init)
+            .with_steps_tracing(self.evm.steps_tracing)
+            .with_print_logs(!self.evm.disable_console_log)
+            .with_print_traces(self.evm.print_traces)
+            .with_auto_impersonate(self.evm.auto_impersonate)
+            .with_ipc(self.ipc)
+            .with_code_size_limit(self.evm.code_size_limit)
+            .disable_code_size_limit(self.evm.disable_code_size_limit)
+            .set_pruned_history(self.prune_history)
+            .with_init_state(self.load_state.or_else(|| self.state.and_then(|s| s.state)))
+            .with_transaction_block_keeper(self.transaction_block_keeper)
+            .with_max_transactions(self.max_transactions)
+            .with_max_persisted_states(self.max_persisted_states)
+            .with_disable_default_create2_deployer(self.evm.disable_default_create2_deployer)
+            .with_disable_pool_balance_checks(self.evm.disable_pool_balance_checks)
+            .with_slots_in_an_epoch(self.slots_in_an_epoch)
+            .with_memory_limit(self.evm.memory_limit)
+            .with_cache_path(self.cache_path))
+    }
+
+    fn account_generator(&self) -> AccountGenerator {
+        let mut generator = AccountGenerator::new(self.accounts as usize)
+            .phrase(DEFAULT_MNEMONIC)
+            .chain_id(self.evm.chain_id.unwrap_or(CHAIN_ID.into()));
+        if let Some(ref mnemonic) = self.mnemonic {
+            generator = generator.phrase(mnemonic);
+        } else if let Some(count) = self.mnemonic_random {
+            let mut rng = rand_08::thread_rng();
+            let mnemonic = match Mnemonic::<English>::new_with_count(&mut rng, count) {
+                Ok(mnemonic) => mnemonic.to_phrase(),
+                Err(err) => {
+                    warn!(target: "node", ?count, %err, "failed to generate mnemonic, falling back to 12-word random mnemonic");
+                    // Fallback: generate a valid 12-word random mnemonic instead of using
+                    // DEFAULT_MNEMONIC
+                    Mnemonic::<English>::new_with_count(&mut rng, 12)
+                        .expect("valid default word count")
+                        .to_phrase()
+                }
+            };
+            generator = generator.phrase(mnemonic);
+        } else if let Some(seed) = self.mnemonic_seed {
+            let mut seed = StdRng::seed_from_u64(seed);
+            let mnemonic = Mnemonic::<English>::new(&mut seed).to_phrase();
+            generator = generator.phrase(mnemonic);
+        }
+        if let Some(ref derivation) = self.derivation_path {
+            generator = generator.derivation_path(derivation);
+        }
+        generator
+    }
+
+    /// Returns the location where to dump the state to.
+    fn dump_state_path(&self) -> Option<PathBuf> {
+        self.dump_state.as_ref().or_else(|| self.state.as_ref().map(|s| &s.path)).cloned()
+    }
+
+    /// Starts the node
+    ///
+    /// See also [crate::spawn()]
+    pub async fn run(self) -> eyre::Result<()> {
+        let dump_state = self.dump_state_path();
+        let dump_interval =
+            self.state_interval.map(Duration::from_secs).unwrap_or(DEFAULT_DUMP_INTERVAL);
+        let preserve_historical_states = self.preserve_historical_states;
+
+        let (api, mut handle) = crate::try_spawn(self.into_node_config()?).await?;
+
+        // sets the signal handler to gracefully shutdown.
+        let mut fork = api.get_fork();
+        let running = Arc::new(AtomicUsize::new(0));
+
+        // handle for the currently running rt, this must be obtained before setting the crtlc
+        // handler, See [Handle::current]
+        let mut signal = handle.shutdown_signal_mut().take();
+
+        let task_manager = handle.task_manager();
+        let mut on_shutdown = task_manager.on_shutdown();
+
+        let mut state_dumper =
+            PeriodicStateDumper::new(api, dump_state, dump_interval, preserve_historical_states);
+
+        task_manager.spawn(async move {
+            // wait for the SIGTERM signal on unix systems
+            #[cfg(unix)]
+            let mut sigterm = Box::pin(async {
+                if let Ok(mut stream) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                {
+                    stream.recv().await;
+                } else {
+                    futures::future::pending::<()>().await;
+                }
+            });
+
+            // On windows, this will never fire.
+            #[cfg(not(unix))]
+            let mut sigterm = Box::pin(futures::future::pending::<()>());
+
+            // await shutdown signal but also periodically flush state
+            tokio::select! {
+                 _ = &mut sigterm => {
+                    trace!("received sigterm signal, shutting down");
+                }
+                _ = &mut on_shutdown => {}
+                _ = &mut state_dumper => {}
+            }
+
+            // shutdown received
+            state_dumper.dump().await;
+
+            // cleaning up and shutting down
+            // this will make sure that the fork RPC cache is flushed if caching is configured
+            if let Some(fork) = fork.take() {
+                trace!("flushing cache on shutdown");
+                fork.database
+                    .read()
+                    .await
+                    .maybe_flush_cache()
+                    .expect("Could not flush cache on fork DB");
+                // cleaning up and shutting down
+                // this will make sure that the fork RPC cache is flushed if caching is configured
+            }
+            std::process::exit(0);
+        });
+
+        ctrlc::set_handler(move || {
+            let prev = running.fetch_add(1, Ordering::SeqCst);
+            if prev == 0 {
+                trace!("received shutdown signal, shutting down");
+                let _ = signal.take();
+            }
+        })
+        .expect("Error setting Ctrl-C handler");
+
+        Ok(handle.await??)
+    }
+}
+
+/// Anvil's EVM related arguments.
+#[derive(Clone, Debug, Parser)]
+#[command(next_help_heading = "EVM options")]
+pub struct AnvilEvmArgs {
+    /// Fetch state over a remote endpoint instead of starting from an empty state.
+    ///
+    /// If you want to fetch state from a specific block number, add a block number like `http://localhost:8545@1400000` or use the `--fork-block-number` argument.
+    ///
+    /// Multiple `--fork-url` flags can be provided to distribute requests across endpoints
+    /// using round-robin load balancing. On failure, the retry layer rotates to the next
+    /// endpoint.
+    #[arg(
+        long,
+        short,
+        visible_alias = "rpc-url",
+        value_name = "URL",
+        help_heading = "Fork config"
+    )]
+    pub fork_url: Vec<ForkUrl>,
+
+    /// Headers to use for the rpc client, e.g. "User-Agent: test-agent"
+    ///
+    /// See --fork-url.
+    #[arg(
+        long = "fork-header",
+        value_name = "HEADERS",
+        help_heading = "Fork config",
+        requires = "fork_url"
+    )]
+    pub fork_headers: Vec<String>,
+
+    /// Timeout in ms for requests sent to remote JSON-RPC server in forking mode.
+    ///
+    /// Default value 45000
+    #[arg(id = "timeout", long = "timeout", help_heading = "Fork config", requires = "fork_url")]
+    pub fork_request_timeout: Option<u64>,
+
+    /// Number of retry requests for spurious networks (timed out requests)
+    ///
+    /// Default value 5
+    #[arg(id = "retries", long = "retries", help_heading = "Fork config", requires = "fork_url")]
+    pub fork_request_retries: Option<u32>,
+
+    /// Fetch state from a specific block number over a remote endpoint.
+    ///
+    /// If negative, the given value is subtracted from the `latest` block number.
+    ///
+    /// See --fork-url.
+    #[arg(
+        long,
+        requires = "fork_url",
+        value_name = "BLOCK",
+        help_heading = "Fork config",
+        allow_hyphen_values = true
+    )]
+    pub fork_block_number: Option<i128>,
+
+    /// Fetch state from after a specific transaction hash has been applied over a remote endpoint.
+    ///
+    /// See --fork-url.
+    #[arg(
+        long,
+        requires = "fork_url",
+        value_name = "TRANSACTION",
+        help_heading = "Fork config",
+        conflicts_with = "fork_block_number"
+    )]
+    pub fork_transaction_hash: Option<B256>,
+
+    /// Initial retry backoff on encountering errors.
+    ///
+    /// See --fork-url.
+    #[arg(long, requires = "fork_url", value_name = "BACKOFF", help_heading = "Fork config")]
+    pub fork_retry_backoff: Option<u64>,
+
+    /// Specify chain id to skip fetching it from remote endpoint. This enables offline-start mode.
+    ///
+    /// You still must pass both `--fork-url` and `--fork-block-number`, and already have your
+    /// required state cached on disk, anything missing locally would be fetched from the
+    /// remote.
+    #[arg(
+        long,
+        help_heading = "Fork config",
+        value_name = "CHAIN",
+        requires = "fork_block_number"
+    )]
+    pub fork_chain_id: Option<Chain>,
+
+    /// Sets the number of assumed available compute units per second for this provider
+    ///
+    /// default value: 330
+    ///
+    /// See also --fork-url and <https://docs.alchemy.com/reference/compute-units#what-are-cups-compute-units-per-second>
+    #[arg(
+        long,
+        requires = "fork_url",
+        alias = "cups",
+        value_name = "CUPS",
+        help_heading = "Fork config"
+    )]
+    pub compute_units_per_second: Option<u64>,
+
+    /// Disables rate limiting for this node's provider.
+    ///
+    /// default value: false
+    ///
+    /// See also --fork-url and <https://docs.alchemy.com/reference/compute-units#what-are-cups-compute-units-per-second>
+    #[arg(
+        long,
+        requires = "fork_url",
+        value_name = "NO_RATE_LIMITS",
+        help_heading = "Fork config",
+        visible_alias = "no-rpc-rate-limit"
+    )]
+    pub no_rate_limit: bool,
+
+    /// Explicitly disables the use of RPC caching.
+    ///
+    /// All storage slots are read entirely from the endpoint.
+    ///
+    /// This flag overrides the project's configuration file.
+    ///
+    /// See --fork-url.
+    #[arg(long, requires = "fork_url", help_heading = "Fork config")]
+    pub no_storage_caching: bool,
+
+    /// The block gas limit.
+    #[arg(long, alias = "block-gas-limit", help_heading = "Environment config")]
+    pub gas_limit: Option<u64>,
+
+    /// Disable the `call.gas_limit <= block.gas_limit` constraint.
+    #[arg(
+        long,
+        value_name = "DISABLE_GAS_LIMIT",
+        help_heading = "Environment config",
+        alias = "disable-gas-limit",
+        conflicts_with = "gas_limit"
+    )]
+    pub disable_block_gas_limit: bool,
+
+    /// Enable the transaction gas limit check as imposed by EIP-7825 (Osaka hardfork).
+    #[arg(long, visible_alias = "tx-gas-limit", help_heading = "Environment config")]
+    pub enable_tx_gas_limit: bool,
+
+    /// EIP-170: Contract code size limit in bytes. Useful to increase this because of tests. To
+    /// disable entirely, use `--disable-code-size-limit`. By default, it is 0x6000 (~25kb).
+    #[arg(long, value_name = "CODE_SIZE", help_heading = "Environment config")]
+    pub code_size_limit: Option<usize>,
+
+    /// Disable EIP-170: Contract code size limit.
+    #[arg(
+        long,
+        value_name = "DISABLE_CODE_SIZE_LIMIT",
+        conflicts_with = "code_size_limit",
+        help_heading = "Environment config"
+    )]
+    pub disable_code_size_limit: bool,
+
+    /// The gas price.
+    #[arg(long, help_heading = "Environment config")]
+    pub gas_price: Option<u128>,
+
+    /// The base fee in a block.
+    #[arg(
+        long,
+        visible_alias = "base-fee",
+        value_name = "FEE",
+        help_heading = "Environment config"
+    )]
+    pub block_base_fee_per_gas: Option<u64>,
+
+    /// Disable the enforcement of a minimum suggested priority fee.
+    #[arg(long, visible_alias = "no-priority-fee", help_heading = "Environment config")]
+    pub disable_min_priority_fee: bool,
+
+    /// The chain ID.
+    #[arg(long, alias = "chain", help_heading = "Environment config")]
+    pub chain_id: Option<Chain>,
+
+    /// Enable steps tracing used for debug calls returning geth-style traces
+    #[arg(long, visible_alias = "tracing")]
+    pub steps_tracing: bool,
+
+    /// Disable printing of `console.log` invocations to stdout.
+    #[arg(long, visible_alias = "no-console-log")]
+    pub disable_console_log: bool,
+
+    /// Enable printing of traces for executed transactions and `eth_call` to stdout.
+    #[arg(long, visible_alias = "enable-trace-printing")]
+    pub print_traces: bool,
+
+    /// Enables automatic impersonation on startup. This allows any transaction sender to be
+    /// simulated as different accounts, which is useful for testing contract behavior.
+    #[arg(long, visible_alias = "auto-unlock")]
+    pub auto_impersonate: bool,
+
+    /// Disable the default create2 deployer
+    #[arg(long, visible_alias = "no-create2")]
+    pub disable_default_create2_deployer: bool,
+
+    /// Disable pool balance checks
+    #[arg(long)]
+    pub disable_pool_balance_checks: bool,
+
+    /// The memory limit per EVM execution in bytes.
+    #[arg(long)]
+    pub memory_limit: Option<u64>,
+
+    #[command(flatten)]
+    pub networks: NetworkConfigs,
+}
+
+/// Resolves an alias passed as fork-url to the matching url defined in the rpc_endpoints section
+/// of the project configuration file.
+/// Does nothing if the fork-url is not a configured alias.
+///
+/// When an alias maps to an `RpcEndpoint` with multiple `endpoints`, all URLs are expanded
+/// into additional `--fork-url` entries for multi-endpoint load balancing.
+impl AnvilEvmArgs {
+    pub fn resolve_rpc_alias(&mut self) {
+        if let Ok(config) = Config::load_with_providers(FigmentProviders::Anvil) {
+            let mut resolved_urls = Vec::new();
+            for fork_url in &self.fork_url {
+                let mut endpoints = config.rpc_endpoints.clone().resolved();
+                if let Some(endpoint) = endpoints.remove(&fork_url.url) {
+                    // Alias matched — expand all URLs from the endpoint config
+                    match endpoint.all_urls() {
+                        Ok(urls) => {
+                            for (i, url) in urls.into_iter().enumerate() {
+                                resolved_urls.push(ForkUrl {
+                                    url,
+                                    // Only the first URL inherits the block suffix
+                                    block: if i == 0 { fork_url.block } else { None },
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(target: "node", alias=%fork_url.url, %e, "could not resolve all endpoints, using primary endpoint only");
+                            if let Ok(url) = endpoint.url() {
+                                resolved_urls.push(ForkUrl { url, block: fork_url.block });
+                            } else {
+                                resolved_urls.push(fork_url.clone());
+                            }
+                        }
+                    }
+                } else if let Some(Ok(url)) = config.get_rpc_url_with_alias(&fork_url.url) {
+                    // Try mesc or other resolution
+                    resolved_urls.push(ForkUrl { url: url.to_string(), block: fork_url.block });
+                } else {
+                    // Not an alias — keep as-is
+                    resolved_urls.push(fork_url.clone());
+                }
+            }
+            self.fork_url = resolved_urls;
+        }
+    }
+}
+
+/// Helper type to periodically dump the state of the chain to disk
+struct PeriodicStateDumper<N: Network> {
+    in_progress_dump: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>>,
+    api: EthApi<N>,
+    dump_state: Option<PathBuf>,
+    preserve_historical_states: bool,
+    interval: Interval,
+}
+
+impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> PeriodicStateDumper<N> {
+    fn new(
+        api: EthApi<N>,
+        dump_state: Option<PathBuf>,
+        interval: Duration,
+        preserve_historical_states: bool,
+    ) -> Self {
+        let dump_state = dump_state.map(|mut dump_state| {
+            if dump_state.is_dir() {
+                dump_state = dump_state.join("state.json");
+            }
+            dump_state
+        });
+
+        // periodically flush the state
+        let interval = tokio::time::interval_at(Instant::now() + interval, interval);
+        Self { in_progress_dump: None, api, dump_state, preserve_historical_states, interval }
+    }
+
+    async fn dump(&self) {
+        if let Some(state) = self.dump_state.clone() {
+            Self::dump_state(self.api.clone(), state, self.preserve_historical_states).await
+        }
+    }
+
+    /// Infallible state dump
+    async fn dump_state(api: EthApi<N>, dump_state: PathBuf, preserve_historical_states: bool) {
+        trace!(path=?dump_state, "Dumping state on shutdown");
+        match api.serialized_state(preserve_historical_states).await {
+            Ok(state) => {
+                if let Err(err) = foundry_common::fs::write_json_file(&dump_state, &state) {
+                    error!(?err, "Failed to dump state");
+                } else {
+                    trace!(path=?dump_state, "Dumped state on shutdown");
+                }
+            }
+            Err(err) => {
+                error!(?err, "Failed to extract state");
+            }
+        }
+    }
+}
+
+// An endless future that periodically dumps the state to disk if configured.
+impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Future for PeriodicStateDumper<N> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.dump_state.is_none() {
+            return Poll::Pending;
+        }
+
+        loop {
+            if let Some(mut flush) = this.in_progress_dump.take() {
+                match flush.poll_unpin(cx) {
+                    Poll::Ready(_) => {
+                        this.interval.reset();
+                    }
+                    Poll::Pending => {
+                        this.in_progress_dump = Some(flush);
+                        return Poll::Pending;
+                    }
+                }
+            }
+
+            if this.interval.poll_tick(cx).is_ready() {
+                let api = this.api.clone();
+                let path = this.dump_state.clone().expect("exists; see above");
+                this.in_progress_dump =
+                    Some(Box::pin(Self::dump_state(api, path, this.preserve_historical_states)));
+            } else {
+                break;
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+/// Represents the --state flag and where to load from, or dump the state to
+#[derive(Clone, Debug)]
+pub struct StateFile {
+    pub path: PathBuf,
+    pub state: Option<SerializableState>,
+}
+
+impl StateFile {
+    /// This is used as the clap `value_parser` implementation to parse from file but only if it
+    /// exists
+    fn parse(path: &str) -> Result<Self, String> {
+        Self::parse_path(path)
+    }
+
+    /// Parse from file but only if it exists
+    pub fn parse_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        let mut path = path.as_ref().to_path_buf();
+        if path.is_dir() {
+            path = path.join("state.json");
+        }
+        let mut state = Self { path, state: None };
+        if !state.path.exists() {
+            return Ok(state);
+        }
+
+        state.state = Some(SerializableState::load(&state.path).map_err(|err| err.to_string())?);
+
+        Ok(state)
+    }
+}
+
+/// Represents the input URL for a fork with an optional trailing block number:
+/// `http://localhost:8545@1000000`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkUrl {
+    /// The endpoint url
+    pub url: String,
+    /// Optional trailing block
+    pub block: Option<u64>,
+}
+
+impl fmt::Display for ForkUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.url.fmt(f)?;
+        if let Some(block) = self.block {
+            write!(f, "@{block}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for ForkUrl {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((url, block)) = s.rsplit_once('@') {
+            if block == "latest" {
+                return Ok(Self { url: url.to_string(), block: None });
+            }
+            // this will prevent false positives for auths `user:password@example.com`
+            if !block.is_empty() && !block.contains(':') && !block.contains('.') {
+                let block: u64 = block
+                    .parse()
+                    .map_err(|_| format!("Failed to parse block number: `{block}`"))?;
+                return Ok(Self { url: url.to_string(), block: Some(block) });
+            }
+        }
+        Ok(Self { url: s.to_string(), block: None })
+    }
+}
+
+/// Parses a hardfork string against the active network configuration.
+fn parse_hardfork(hf: &str, networks: &NetworkConfigs) -> eyre::Result<FoundryHardfork> {
+    #[cfg(feature = "optimism")]
+    if networks.is_optimism() {
+        return Ok(OpHardfork::from_str(hf)?.into());
+    }
+    if networks.is_arc() {
+        return Ok(foundry_evm::hardfork::parse_local_arc_hardfork(hf)
+            .map_err(eyre::Report::msg)?
+            .into());
+    }
+    if networks.is_tempo() {
+        Ok(TempoHardfork::from_str(hf)?.into())
+    } else {
+        Ok(EthereumHardfork::from_str(hf)?.into())
+    }
+}
+
+/// Clap's value parser for genesis. Loads a genesis.json file.
+fn read_genesis_file(path: &str) -> Result<Genesis, String> {
+    foundry_common::fs::read_json_file(path.as_ref()).map_err(|err| err.to_string())
+}
+
+fn duration_from_secs_f64(s: &str) -> Result<Duration, String> {
+    let s = s.parse::<f64>().map_err(|e| e.to_string())?;
+    if s == 0.0 {
+        return Err("Duration must be greater than 0".to_string());
+    }
+    Duration::try_from_secs_f64(s).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foundry_evm::hardfork::ArcHardfork;
+    use std::{env, net::Ipv4Addr};
+
+    #[test]
+    fn test_parse_fork_url() {
+        let fork: ForkUrl = "http://localhost:8545@1000000".parse().unwrap();
+        assert_eq!(
+            fork,
+            ForkUrl { url: "http://localhost:8545".to_string(), block: Some(1000000) }
+        );
+
+        let fork: ForkUrl = "http://localhost:8545".parse().unwrap();
+        assert_eq!(fork, ForkUrl { url: "http://localhost:8545".to_string(), block: None });
+
+        let fork: ForkUrl = "wss://user:password@example.com/".parse().unwrap();
+        assert_eq!(
+            fork,
+            ForkUrl { url: "wss://user:password@example.com/".to_string(), block: None }
+        );
+
+        let fork: ForkUrl = "wss://user:password@example.com/@latest".parse().unwrap();
+        assert_eq!(
+            fork,
+            ForkUrl { url: "wss://user:password@example.com/".to_string(), block: None }
+        );
+
+        let fork: ForkUrl = "wss://user:password@example.com/@100000".parse().unwrap();
+        assert_eq!(
+            fork,
+            ForkUrl { url: "wss://user:password@example.com/".to_string(), block: Some(100000) }
+        );
+    }
+
+    #[test]
+    fn can_parse_ethereum_hardfork() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--hardfork", "berlin"]);
+        let config = args.into_node_config().unwrap();
+        assert_eq!(config.hardfork, Some(EthereumHardfork::Berlin.into()));
+    }
+
+    #[test]
+    fn can_parse_optimism_hardfork() {
+        let args: NodeArgs =
+            NodeArgs::parse_from(["anvil", "--optimism", "--hardfork", "Regolith"]);
+        let config = args.into_node_config().unwrap();
+        assert_eq!(config.hardfork, Some(OpHardfork::Regolith.into()));
+    }
+
+    #[test]
+    fn arc_hardfork_and_protocol_gas_limit_are_preserved() {
+        let config = NodeArgs::parse_from([
+            "anvil",
+            "--arc",
+            "--hardfork",
+            "arc:zero6",
+            "--gas-limit",
+            "30000000",
+        ])
+        .into_node_config()
+        .unwrap();
+        assert_eq!(config.hardfork, Some(ArcHardfork::Zero6.into()));
+        assert_eq!(config.networks.arc_hardfork(), Some(ArcHardfork::Zero6));
+    }
+
+    /// Local Arc runs the shared default, and it lands on both channels: `hardfork` drives what
+    /// `anvil_nodeInfo` reports, `networks.arc_hardfork` drives the executing chainspec.
+    #[test]
+    fn arc_local_uses_the_shared_default_hardfork() {
+        let expected = foundry_evm::hardfork::default_local_arc_hardfork();
+        let config =
+            NodeArgs::parse_from(["anvil", "--network", "arc"]).into_node_config().unwrap();
+        assert_eq!(config.hardfork, Some(expected.into()));
+        assert_eq!(config.networks.arc_hardfork(), Some(expected));
+    }
+
+    /// A local node on the full localdev schedule stays reachable by naming the fork, which is the
+    /// escape hatch from the mainnet-aligned default.
+    #[test]
+    fn arc_local_can_opt_into_the_newest_selectable_hardfork() {
+        let newest = *foundry_evm::hardfork::LOCAL_ARC_HARDFORKS.last().unwrap();
+        let config = NodeArgs::parse_from([
+            "anvil",
+            "--network",
+            "arc",
+            "--hardfork",
+            &format!("arc:{}", newest.to_string().to_lowercase()),
+        ])
+        .into_node_config()
+        .unwrap();
+        assert_eq!(config.hardfork, Some(newest.into()));
+        assert_eq!(config.networks.arc_hardfork(), Some(newest));
+    }
+
+    // A non-protocol `--gas-limit` is rejected at node startup, not during config parsing (see
+    // `arc_fork_defers_gas_limit_validation_until_chain_detection`). Startup rejection is covered
+    // for every selectable hardfork by the
+    // `arc_startup_rejects_gas_limit_not_matching_protocol_config` integration test, which
+    // drives the real `validate_arc_startup_gas_limit` path against derived ProtocolConfig
+    // state.
+
+    #[test]
+    fn arc_cli_rejects_hardforks_before_zero6() {
+        for hf in ["zero3", "zero4", "zero5", "arc:zero5"] {
+            let err = NodeArgs::parse_from(["anvil", "--arc", "--hardfork", hf])
+                .into_node_config()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot be selected for local execution"), "{hf}: {err}");
+        }
+    }
+
+    #[test]
+    fn arc_fork_defers_gas_limit_validation_until_chain_detection() {
+        let config = NodeArgs::parse_from([
+            "anvil",
+            "--arc",
+            "--fork-url",
+            "https://arc.example/rpc",
+            "--gas-limit",
+            "100000",
+        ])
+        .into_node_config()
+        .unwrap();
+        assert_eq!(config.hardfork, None);
+        assert_eq!(config.networks.arc_hardfork(), None);
+    }
+
+    #[test]
+    fn arc_chain_id_auto_detection_survives_config_builder_order() {
+        let config =
+            NodeArgs::parse_from(["anvil", "--chain-id", "5042002"]).into_node_config().unwrap();
+        assert!(config.networks.is_arc());
+    }
+
+    #[test]
+    fn cant_parse_invalid_hardfork() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--hardfork", "Regolith"]);
+        let config = args.into_node_config();
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn can_parse_fork_headers() {
+        let args: NodeArgs = NodeArgs::parse_from([
+            "anvil",
+            "--fork-url",
+            "http,://localhost:8545",
+            "--fork-header",
+            "User-Agent: test-agent",
+            "--fork-header",
+            "Referrer: example.com",
+        ]);
+        assert_eq!(args.evm.fork_headers, vec!["User-Agent: test-agent", "Referrer: example.com"]);
+    }
+
+    #[test]
+    fn can_parse_prune_config() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--prune-history"]);
+        assert!(args.prune_history.is_some());
+
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--prune-history", "100"]);
+        assert_eq!(args.prune_history, Some(Some(100)));
+    }
+
+    #[test]
+    fn can_parse_max_persisted_states_config() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--max-persisted-states", "500"]);
+        assert_eq!(args.max_persisted_states, (Some(500)));
+    }
+
+    #[test]
+    fn can_parse_disable_block_gas_limit() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--disable-block-gas-limit"]);
+        assert!(args.evm.disable_block_gas_limit);
+
+        let args =
+            NodeArgs::try_parse_from(["anvil", "--disable-block-gas-limit", "--gas-limit", "100"]);
+        assert!(args.is_err());
+    }
+
+    #[test]
+    fn can_parse_enable_tx_gas_limit() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--enable-tx-gas-limit"]);
+        assert!(args.evm.enable_tx_gas_limit);
+
+        // Also test the alias
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--tx-gas-limit"]);
+        assert!(args.evm.enable_tx_gas_limit);
+    }
+
+    #[test]
+    fn can_parse_disable_code_size_limit() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--disable-code-size-limit"]);
+        assert!(args.evm.disable_code_size_limit);
+
+        let args = NodeArgs::try_parse_from([
+            "anvil",
+            "--disable-code-size-limit",
+            "--code-size-limit",
+            "100",
+        ]);
+        // can't be used together
+        assert!(args.is_err());
+    }
+
+    #[test]
+    fn can_parse_host() {
+        let args = NodeArgs::parse_from(["anvil"]);
+        assert_eq!(args.host, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+
+        let args = NodeArgs::parse_from([
+            "anvil", "--host", "::1", "--host", "1.1.1.1", "--host", "2.2.2.2",
+        ]);
+        assert_eq!(
+            args.host,
+            ["::1", "1.1.1.1", "2.2.2.2"].map(|ip| ip.parse::<IpAddr>().unwrap()).to_vec()
+        );
+
+        let args = NodeArgs::parse_from(["anvil", "--host", "::1,1.1.1.1,2.2.2.2"]);
+        assert_eq!(
+            args.host,
+            ["::1", "1.1.1.1", "2.2.2.2"].map(|ip| ip.parse::<IpAddr>().unwrap()).to_vec()
+        );
+
+        unsafe { env::set_var("ANVIL_IP_ADDR", "1.1.1.1") };
+        let args = NodeArgs::parse_from(["anvil"]);
+        assert_eq!(args.host, vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+
+        unsafe { env::set_var("ANVIL_IP_ADDR", "::1,1.1.1.1,2.2.2.2") };
+        let args = NodeArgs::parse_from(["anvil"]);
+        assert_eq!(
+            args.host,
+            ["::1", "1.1.1.1", "2.2.2.2"].map(|ip| ip.parse::<IpAddr>().unwrap()).to_vec()
+        );
+    }
+
+    #[test]
+    fn can_parse_multiple_fork_urls() {
+        let args: NodeArgs = NodeArgs::parse_from([
+            "anvil",
+            "--fork-url",
+            "http://localhost:8545",
+            "--fork-url",
+            "http://localhost:8546",
+            "--fork-url",
+            "http://localhost:8547",
+        ]);
+        assert_eq!(args.evm.fork_url.len(), 3);
+        assert_eq!(args.evm.fork_url[0].url, "http://localhost:8545");
+        assert_eq!(args.evm.fork_url[1].url, "http://localhost:8546");
+        assert_eq!(args.evm.fork_url[2].url, "http://localhost:8547");
+
+        // Block suffix on first URL should work
+        let args: NodeArgs = NodeArgs::parse_from([
+            "anvil",
+            "--fork-url",
+            "http://localhost:8545@1000000",
+            "--fork-url",
+            "http://localhost:8546",
+        ]);
+        assert_eq!(args.evm.fork_url[0].block, Some(1000000));
+        assert_eq!(args.evm.fork_url[1].block, None);
+    }
+
+    #[test]
+    fn rejects_block_suffix_on_secondary_fork_urls() {
+        let args: NodeArgs = NodeArgs::parse_from([
+            "anvil",
+            "--fork-url",
+            "http://localhost:8545@1000000",
+            "--fork-url",
+            "http://localhost:8546@2000000",
+        ]);
+        let result = args.into_node_config();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Block number suffixes"),
+            "should reject block suffix on secondary fork URL"
+        );
+    }
+
+    #[test]
+    fn fork_dependent_args_require_fork_url() {
+        // All these args have `requires = "fork_url"` — they should fail without --fork-url
+        let cases = [
+            vec!["anvil", "--fork-header", "X-Api-Key: test"],
+            vec!["anvil", "--timeout", "5000"],
+            vec!["anvil", "--retries", "3"],
+            vec!["anvil", "--fork-block-number", "100"],
+            vec!["anvil", "--fork-retry-backoff", "500"],
+        ];
+        for args in &cases {
+            let result = NodeArgs::try_parse_from(args);
+            assert!(result.is_err(), "expected error when using {:?} without --fork-url", args[1]);
+        }
+    }
+}

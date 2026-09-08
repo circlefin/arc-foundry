@@ -1,0 +1,629 @@
+[workspace]
+members = [
+    "benches/",
+    "crates/anvil/",
+    "crates/anvil/core/",
+    "crates/anvil/rpc/",
+    "crates/anvil/server/",
+    "crates/cast/",
+    "crates/cheatcodes/",
+    "crates/cheatcodes/spec/",
+    "crates/chisel/",
+    "crates/cli/",
+    "crates/common/",
+    "crates/config/",
+    "crates/debugger/",
+    "crates/doc/",
+    "crates/evm/core/",
+    "crates/evm/coverage/",
+    "crates/evm/evm/",
+    "crates/evm/fuzz/",
+    "crates/evm/sancov/",
+    "crates/evm/hardforks/",
+    "crates/evm/traces/",
+    "crates/fmt/",
+    "crates/forge/",
+    "crates/lint/",
+    "crates/macros/",
+    "crates/primitives/",
+    "crates/script-sequence/",
+    "crates/test-utils/",
+    "crates/cli-markdown/",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.7.1"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Foundry Contributors"]
+license = "MIT OR Apache-2.0"
+homepage = "https://getfoundry.sh"
+repository = "https://github.com/foundry-rs/foundry"
+exclude = ["benches/", "tests/", "test-data/", "testdata/"]
+
+[workspace.lints.clippy]
+borrow_as_ptr = "warn"
+branches_sharing_code = "warn"
+clear_with_drain = "warn"
+cloned_instead_of_copied = "warn"
+collection_is_never_read = "warn"
+dbg_macro = "warn"
+derive_partial_eq_without_eq = "warn"
+empty_line_after_doc_comments = "warn"
+empty_line_after_outer_attr = "warn"
+enum_glob_use = "warn"
+equatable_if_let = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+flat_map_option = "warn"
+from_iter_instead_of_collect = "warn"
+if_then_some_else_none = "warn"
+implicit_clone = "warn"
+if_not_else = "warn"
+imprecise_flops = "warn"
+iter_on_empty_collections = "warn"
+iter_with_drain = "warn"
+iter_without_into_iter = "warn"
+large_stack_frames = "warn"
+manual_assert = "warn"
+manual_clamp = "warn"
+manual_string_new = "warn"
+missing_const_for_fn = "warn"
+mutex_integer = "warn"
+naive_bytecount = "warn"
+needless_bitwise_bool = "warn"
+needless_continue = "warn"
+needless_for_each = "warn"
+nonstandard_macro_braces = "warn"
+option_as_ref_cloned = "warn"
+path_buf_push_overwrite = "warn"
+read_zero_byte_vec = "warn"
+redundant_clone = "warn"
+single_char_pattern = "warn"
+redundant_else = "warn"
+string_lit_as_bytes = "warn"
+string_lit_chars_any = "warn"
+suboptimal_flops = "warn"
+suspicious_operation_groupings = "warn"
+trailing_empty_array = "warn"
+trait_duplication_in_bounds = "warn"
+transmute_undefined_repr = "warn"
+trivial_regex = "warn"
+tuple_array_conversions = "warn"
+uninhabited_references = "warn"
+unnecessary_struct_initialization = "warn"
+uninlined_format_args = "warn"
+unnecessary_self_imports = "warn"
+unnested_or_patterns = "warn"
+unused_peekable = "warn"
+unused_rounding = "warn"
+use_self = "warn"
+useless_let_if_seq = "warn"
+while_float = "warn"
+zero_sized_map_values = "warn"
+
+# Explicitly allowed nursery lints — too noisy or have known false positives.
+as_ptr_cast_mut = "allow"
+cognitive_complexity = "allow"
+debug_assert_with_mut_call = "allow"
+fallible_impl_from = "allow"
+future_not_send = "allow"
+needless_collect = "allow"
+non_send_fields_in_send_ty = "allow"
+redundant_pub_crate = "allow"
+significant_drop_in_scrutinee = "allow"
+significant_drop_tightening = "allow"
+too_long_first_doc_paragraph = "allow"
+
+# Specific allows.
+result_large_err = "allow"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+
+[workspace.lints.rustdoc]
+all = "warn"
+
+# Speed up compilation time for dev builds by reducing emitted debug info.
+# NOTE: Debuggers may provide less useful information with this setting.
+# Uncomment this section if you're using a debugger.
+[profile.dev]
+# https://davidlattimore.github.io/posts/2024/02/04/speeding-up-the-rust-edit-build-run-cycle.html
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "none"
+strip = "debuginfo"
+panic = "abort"
+codegen-units = 16
+
+# Use the `--profile profiling` flag to show symbols in release mode.
+# e.g. `cargo build --profile profiling`
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"
+
+[profile.bench]
+inherits = "profiling"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.fuzz]
+inherits = "release"
+lto = "thin"
+strip = "none"
+debug = "line-tables-only"
+
+# Speed up tests and dev build.
+[profile.dev.package]
+# Solc and artifacts.
+foundry-compilers-artifacts-solc.opt-level = 3
+foundry-compilers-core.opt-level = 3
+foundry-compilers.opt-level = 3
+serde_json.opt-level = 3
+serde.opt-level = 3
+
+solar-compiler.opt-level = 3
+solar-ast.opt-level = 3
+solar-data-structures.opt-level = 3
+solar-interface.opt-level = 3
+solar-parse.opt-level = 3
+solar-sema.opt-level = 3
+
+# CLI.
+clap.opt-level = 3
+clap_builder.opt-level = 3
+clap_lex.opt-level = 3
+
+# EVM.
+alloy-dyn-abi.opt-level = 3
+alloy-json-abi.opt-level = 3
+alloy-primitives.opt-level = 3
+alloy-sol-type-parser.opt-level = 3
+alloy-sol-types.opt-level = 3
+alloy-evm.opt-level = 3
+
+bitvec.opt-level = 3
+revm.opt-level = 3
+revm-bytecode.opt-level = 3
+revm-context.opt-level = 3
+revm-context-interface.opt-level = 3
+revm-database.opt-level = 3
+revm-database-interface.opt-level = 3
+revm-handler.opt-level = 3
+revm-inspector.opt-level = 3
+revm-interpreter.opt-level = 3
+revm-precompile.opt-level = 3
+revm-primitives.opt-level = 3
+revm-state.opt-level = 3
+
+revm-inspectors.opt-level = 3
+
+ruint.opt-level = 3
+
+sha2.opt-level = 3
+sha3.opt-level = 3
+keccak.opt-level = 3
+
+# Fuzzing.
+proptest.opt-level = 3
+foundry-evm-fuzz.opt-level = 3
+rand.opt-level = 3
+rand_chacha.opt-level = 3
+ppv-lite86.opt-level = 3
+
+# Backtraces.
+addr2line.opt-level = 3
+backtrace.opt-level = 3
+gimli.opt-level = 3
+
+# Forking.
+axum.opt-level = 3
+
+# Keystores.
+scrypt.opt-level = 3
+
+# Misc.
+hashbrown.opt-level = 3
+foldhash.opt-level = 3
+rayon.opt-level = 3
+rayon-core.opt-level = 3
+regex.opt-level = 3
+regex-syntax.opt-level = 3
+regex-automata.opt-level = 3
+walkdir.opt-level = 3
+
+# Override packages which aren't perf-sensitive for faster compilation speed and smaller binary size.
+[profile.release.package]
+alloy-sol-macro-expander.opt-level = "s"
+figment2.opt-level = "s"
+foundry-compilers-artifacts-solc.opt-level = "s"
+foundry-config.opt-level = "s"
+html5ever.opt-level = "s"
+mdbook-driver.opt-level = "s"
+prettyplease.opt-level = "s"
+protobuf.opt-level = "s"
+pulldown-cmark.opt-level = "s"
+syn-solidity.opt-level = "s"
+syn.opt-level = "s"
+trezor-client.opt-level = "s"
+
+# Networking stack (not perf-critical for CLI tools).
+reqwest.opt-level = "s"
+hyper.opt-level = "s"
+hyper-util.opt-level = "s"
+h2.opt-level = "s"
+rustls.opt-level = "s"
+tower.opt-level = "s"
+tower-http.opt-level = "s"
+
+# Doc generation / templating.
+mdbook-core.opt-level = "s"
+mdbook-html.opt-level = "s"
+font-awesome-as-a-crate.opt-level = "s"
+handlebars.opt-level = "s"
+
+# Watch mode.
+watchexec.opt-level = "s"
+watchexec-events.opt-level = "s"
+watchexec-signals.opt-level = "s"
+watchexec-supervisor.opt-level = "s"
+
+# Soldeer package manager.
+soldeer-commands.opt-level = "s"
+soldeer-core.opt-level = "s"
+
+# Parsing / editing (not perf-sensitive in CLI).
+toml_edit.opt-level = "s"
+toml.opt-level = "s"
+
+# Block explorers / verification.
+foundry-block-explorers.opt-level = "s"
+
+# Misc CLI dependencies.
+clap_builder.opt-level = "s"
+clap_complete.opt-level = "s"
+comfy-table.opt-level = "s"
+indicatif.opt-level = "s"
+dialoguer.opt-level = "s"
+ratatui.opt-level = "s"
+crossterm.opt-level = "s"
+
+# Alloy JSON (parsing, not hot path).
+alloy-json-abi.opt-level = "s"
+
+[workspace.dependencies]
+anvil = { path = "crates/anvil", default-features = false }
+cast = { path = "crates/cast", default-features = false }
+chisel = { path = "crates/chisel", default-features = false }
+forge = { path = "crates/forge", default-features = false }
+
+forge-doc = { path = "crates/doc", default-features = false }
+forge-fmt = { path = "crates/fmt", default-features = false }
+forge-lint = { path = "crates/lint", default-features = false }
+forge-verify = { path = "crates/verify", default-features = false }
+forge-script = { path = "crates/script", default-features = false }
+forge-sol-macro-gen = { path = "crates/sol-macro-gen", default-features = false }
+forge-script-sequence = { path = "crates/script-sequence", default-features = false }
+foundry-cheatcodes = { path = "crates/cheatcodes", default-features = false }
+foundry-cheatcodes-spec = { path = "crates/cheatcodes/spec" }
+foundry-cli = { path = "crates/cli", default-features = false }
+foundry-cli-markdown = { path = "crates/cli-markdown" }
+foundry-common = { path = "crates/common", default-features = false }
+foundry-common-fmt = { path = "crates/common/fmt", default-features = false }
+foundry-config = { path = "crates/config" }
+foundry-debugger = { path = "crates/debugger", default-features = false }
+foundry-evm = { path = "crates/evm/evm", default-features = false }
+foundry-evm-abi = { path = "crates/evm/abi" }
+foundry-evm-core = { path = "crates/evm/core", default-features = false }
+foundry-evm-coverage = { path = "crates/evm/coverage", default-features = false }
+foundry-evm-hardforks = { path = "crates/evm/hardforks", default-features = false }
+foundry-evm-networks = { path = "crates/evm/networks", default-features = false }
+foundry-evm-fuzz = { path = "crates/evm/fuzz", default-features = false }
+foundry-evm-sancov = { path = "crates/evm/sancov" }
+foundry-evm-traces = { path = "crates/evm/traces", default-features = false }
+foundry-macros = { path = "crates/macros" }
+foundry-test-utils = { path = "crates/test-utils", default-features = false }
+foundry-wallets = { version = "0.1.0", default-features = false }
+foundry-linking = { path = "crates/linking" }
+foundry-primitives = { path = "crates/primitives", default-features = false }
+
+# solc & compilation utilities
+foundry-block-explorers = { version = "0.23.0", default-features = false }
+foundry-compilers = { version = "0.20.0", default-features = false, features = [
+    "rustls",
+    "svm-solc",
+] }
+foundry-fork-db = { version = "0.26.0", features = ["zstd"] }
+solar = { package = "solar-compiler", version = "=0.1.8", default-features = false }
+svm = { package = "svm-rs", version = "0.5", default-features = false, features = [
+    "rustls",
+] }
+
+## alloy
+alloy-consensus = { version = "2.0.1", default-features = false }
+alloy-contract = { version = "2.0.1", default-features = false }
+alloy-eips = { version = "2.0.1", default-features = false }
+alloy-eip5792 = { version = "2.0.1", default-features = false }
+alloy-ens = { version = "2.0.1", default-features = false }
+alloy-genesis = { version = "2.0.1", default-features = false }
+alloy-json-rpc = { version = "2.0.1", default-features = false }
+alloy-network = { version = "2.0.1", default-features = false }
+alloy-provider = { version = "2.0.1", default-features = false }
+alloy-pubsub = { version = "2.0.1", default-features = false }
+alloy-rpc-client = { version = "2.0.1", default-features = false }
+alloy-rpc-types = { version = "2.0.1", default-features = true }
+alloy-rpc-types-beacon = { version = "2.0.1", default-features = true }
+alloy-rpc-types-engine = { version = "2.0.1", default-features = false }
+alloy-rpc-types-eth = { version = "2.0.1", default-features = false }
+alloy-serde = { version = "2.0.1", default-features = false }
+alloy-signer = { version = "2.0.1", default-features = false }
+alloy-signer-aws = { version = "2.0.1", default-features = false }
+alloy-signer-gcp = { version = "2.0.1", default-features = false }
+alloy-signer-ledger = { version = "2.0.1", default-features = false }
+alloy-signer-local = { version = "2.0.1", default-features = false }
+alloy-signer-trezor = { version = "2.0.1", default-features = false }
+alloy-signer-turnkey = { version = "2.0.1", default-features = false }
+alloy-transport = { version = "2.0.1", default-features = false }
+alloy-transport-http = { version = "2.0.1", default-features = false }
+alloy-transport-ipc = { version = "2.0.1", default-features = false }
+alloy-transport-ws = { version = "2.0.1", default-features = false }
+alloy-hardforks = { version = "0.4.7", default-features = false }
+alloy-op-hardforks = { version = "0.4.7", default-features = false }
+
+## alloy-core
+alloy-dyn-abi = "1.5.2"
+alloy-json-abi = "1.5.2"
+alloy-primitives = { version = "1.5.2", features = [
+    "getrandom",
+    "rand",
+    "map-fxhash",
+    "map-foldhash",
+] }
+alloy-sol-macro-expander = "1.5.2"
+alloy-sol-macro-input = "1.5.2"
+alloy-sol-types = "1.5.2"
+
+alloy-chains = "0.2"
+alloy-rlp = "0.3"
+alloy-trie = "0.9"
+
+## op-alloy
+op-alloy-consensus = "0.24.0"
+op-alloy-network = "0.24.0"
+op-alloy-rpc-types = "0.24.0"
+op-alloy-flz = "0.13.1"
+
+## alloy-evm
+alloy-evm = "0.34.0"
+alloy-op-evm = "0.31.0"
+
+## arc
+arc-evm = { git = "https://github.com/circlefin/arc-node.git", tag = "v0.8.0" }
+arc-execution-config = { git = "https://github.com/circlefin/arc-node.git", tag = "v0.8.0", features = ["test-utils"] }
+arc-precompiles = { git = "https://github.com/circlefin/arc-node.git", tag = "v0.8.0" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
+
+# revm
+revm = { version = "38.0.0", default-features = false }
+revm-inspectors = { version = "0.39.0", features = ["serde"] }
+op-revm = { version = "19.0.0", default-features = false }
+
+## cli
+anstream = "0.6"
+anstyle = "1.0"
+dialoguer = { version = "0.12", default-features = false, features = [
+    "password",
+] }
+clap_complete = "4"
+clap_complete_nushell = "4"
+
+# macros
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = "2.0"
+async-trait = "0.1"
+derive_more = { version = "2.1", features = ["full"] }
+thiserror = "2"
+
+# allocators
+mimalloc = "0.1"
+tikv-jemallocator = "0.6"
+
+# misc
+auto_impl = "1"
+bytes = "1.11"
+walkdir = "2"
+prettyplease = "0.2"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "std",
+] }
+axum = "0.8"
+ciborium = "0.2"
+color-eyre = "0.6"
+comfy-table = "7"
+dirs = "6"
+dunce = "1"
+evm-disassembler = "0.6"
+evmole = "0.8"
+eyre = "0.6"
+figment = { package = "figment2", version = "0.11" }
+futures = { version = "0.3", default-features = false }
+hyper = "1.8"
+indicatif = "0.18"
+itertools = "0.14"
+jsonpath_lib = "0.3"
+k256 = "0.13"
+mesc = "0.3"
+memchr = "2.7"
+num-format = "0.4"
+parking_lot = "0.12"
+proptest = "1.9.0"
+rand = "0.9"
+rand_08 = { package = "rand", version = "0.8" }
+rayon = "1"
+regex = { version = "1", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rustls = "0.23"
+semver = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+similar-asserts = "1.7"
+soldeer-commands = "=0.10.0"
+soldeer-core = { version = "=0.10.1", features = ["serde"] }
+strum = "0.27"
+tempfile = "3.23"
+tokio = "1"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+toml = "0.9"
+toml_edit = "0.24"
+tower = "0.5"
+tower-http = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+url = "2"
+vergen = { package = "vergen-gitcl", version = "10.0.0-beta.5", default-features = false, features = [
+    "build",
+    "cargo",
+] }
+yansi = { version = "1.0", features = ["detect-tty", "detect-env"] }
+path-slash = "0.2"
+jiff = { version = "0.2", default-features = false, features = [
+    "std",
+    "perf-inline",
+] }
+heck = "0.5"
+uuid = "1.19.0"
+flate2 = "1.1"
+ethereum_ssz = "0.10"
+
+# Tempo
+mpp = { git = "https://github.com/tempoxyz/mpp-rs", rev = "554d20112eb014bd223d54de7f152ca59b2aa4fd", default-features = false, features = [
+    "tempo",
+    "client",
+    "reqwest-rustls-tls",
+    "ws",
+] }
+tempo-chainspec = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa", default-features = false }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa", default-features = false, features = [
+    "serde",
+] }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa", default-features = false }
+tempo-evm = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa", default-features = false }
+tempo-revm = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa", default-features = false, features = [
+    "serde",
+] }
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa" }
+tempo-precompiles = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa" }
+
+## Pinned dependencies. Enabled for the workspace in crates/test-utils.
+
+# testing
+snapbox = { version = "0.6", features = ["json", "regex", "term-svg"] }
+
+# Use unicode-rs which has a smaller binary size than the default ICU4X as the IDNA backend, used
+# by the `url` crate.
+# See the `idna_adapter` README.md for more details: https://docs.rs/crate/idna_adapter/latest
+idna_adapter = "=1.1.0"
+
+[patch.crates-io]
+# https://github.com/rust-cli/rexpect/pull/106
+rexpect = { git = "https://github.com/rust-cli/rexpect", rev = "2ed0b1898d7edaf6a85bedbae71a01cc578958fc" }
+# Tempo's commonware release requires ctutils 0.3 with a prerelease cmov, while
+# Arc's PQ precompile requires ctutils 0.4 with stable cmov. The two cmov versions cannot
+# coexist in one build, so `^0.3` requirements are redirected to 0.4.2 via the shim. Arc's
+# own `^0.4` requirement still resolves to the real crates.io 0.4.2.
+#
+# This is safe for a constant-time crate because 0.4.0's breaking changes were removals
+# (`BytesCtEq`/`BytesCtSelect`) and a trait split (`CtAssign` out of `CtSelect`) — both would
+# be compile errors, not silent behaviour changes. commonware-cryptography only uses `Choice`
+# and `CtEq` (bls12381/primitives/group.rs, secret.rs), which are unchanged in 0.4, and the
+# underlying cmov moves from 0.5.0-pre.0 to stable 0.5.3.
+# TODO: drop this shim once commonware moves to ctutils 0.4.
+ctutils = { path = "vendor/ctutils-compat" }
+
+## alloy-core
+# alloy-dyn-abi = { path = "../../alloy-rs/core/crates/dyn-abi" }
+# alloy-json-abi = { path = "../../alloy-rs/core/crates/json-abi" }
+# alloy-primitives = { path = "../../alloy-rs/core/crates/primitives" }
+# alloy-sol-macro = { path = "../../alloy-rs/core/crates/sol-macro" }
+# alloy-sol-macro-expander = { path = "../../alloy-rs/core/crates/sol-macro-expander" }
+# alloy-sol-macro-input = { path = "../../alloy-rs/core/crates/sol-macro-input" }
+# alloy-sol-type-parser = { path = "../../alloy-rs/core/crates/sol-type-parser" }
+# alloy-sol-types = { path = "../../alloy-rs/core/crates/sol-types" }
+# syn-solidity = { path = "../../alloy-rs/core/crates/syn-solidity" }
+
+## alloy
+# alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-consensus-any = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-contract = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-eips = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-eip5792 = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-ens = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-genesis = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-json-rpc = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-network = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-network-primitives = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-provider = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-pubsub = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-rpc-client = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-rpc-types = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-rpc-types-beacon = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-rpc-types-eth = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-rpc-types-trace = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-rpc-types-engine = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-serde = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-signer = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-signer-aws = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-signer-gcp = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-signer-ledger = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-signer-local = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-signer-trezor = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-signer-turnkey = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-transport = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-transport-http = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-transport-ipc = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-transport-ws = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy-tx-macros = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+# alloy = { git = "https://github.com/alloy-rs/alloy", rev = "395521c" }
+
+## alloy-evm
+# alloy-evm = { git = "https://github.com/paradigmxyz/evm.git", rev = "04d8e4a" }
+
+## op-revm / op-alloy / alloy-op-evm
+op-revm = { git = "https://github.com/ethereum-optimism/optimism", rev = "e3b59e76588f99db17205f5601e45a5b00f0bfbb" }
+op-alloy-consensus = { git = "https://github.com/ethereum-optimism/optimism", rev = "e3b59e76588f99db17205f5601e45a5b00f0bfbb" }
+op-alloy-network = { git = "https://github.com/ethereum-optimism/optimism", rev = "e3b59e76588f99db17205f5601e45a5b00f0bfbb" }
+op-alloy-rpc-types = { git = "https://github.com/ethereum-optimism/optimism", rev = "e3b59e76588f99db17205f5601e45a5b00f0bfbb" }
+alloy-op-evm = { git = "https://github.com/ethereum-optimism/optimism", rev = "e3b59e76588f99db17205f5601e45a5b00f0bfbb" }
+alloy-op-hardforks = { git = "https://github.com/ethereum-optimism/optimism", rev = "e3b59e76588f99db17205f5601e45a5b00f0bfbb" }
+
+## foundry-fork-db
+# foundry-fork-db = { git = "https://github.com/foundry-rs/foundry-core", rev = "2f90eb86d4549fa15a8cc2d99bfc1039bc083977" }
+
+## tempo — unify crates.io versions (pulled by mpp) with git rev
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa" }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa" }
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d6a75cc264029dcf54183adea38d3cfaa" }
+
+# solar
+solar = { package = "solar-compiler", git = "https://github.com/paradigmxyz/solar", rev = "530f129" }
+solar-interface = { package = "solar-interface", git = "https://github.com/paradigmxyz/solar", rev = "530f129" }
+solar-ast = { package = "solar-ast", git = "https://github.com/paradigmxyz/solar", rev = "530f129" }
+solar-sema = { package = "solar-sema", git = "https://github.com/paradigmxyz/solar", rev = "530f129" }
+
+[workspace.metadata.cargo-shear]
+ignored = ["idna_adapter", "cast", "chisel", "forge", "alloy-contract"]
