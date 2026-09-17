@@ -1,0 +1,215 @@
+name: Build Docker
+
+# Builds and publishes the public arc-foundry docker image (forge/cast/anvil/
+# chisel) to Cloudsmith. Mirrors circlefin/arc-node's build-docker.yaml, trimmed
+# to a single image. Runs on the public repo (GitHub-hosted runners); the
+# Dockerfile and docker-bake.hcl come from the sync, with the private dependency
+# already rewritten to the public arc-node, so no auth token is needed.
+#
+# Multi-arch is built natively (one runner per arch), pushed by digest, then
+# combined into a manifest list. Provenance/SBOM attestation is intentionally
+# omitted here (tracked separately).
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+    branches:
+      - main
+      - release/*
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to build and publish the docker image for (e.g. v0.8.0-2)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish the docker image for (e.g. v0.8.0-2)'
+        required: true
+        type: string
+
+concurrency:
+  group: docker-${{ inputs.tag != '' && inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: docker.cloudsmith.io
+  REGISTRY_NAMESPACE: circle/arc-network
+  IMAGE_NAME: foundry
+  # Public binaries are built with the release profile (see release.yml); use the
+  # same here. It is also lighter on memory than the private dist (fat-LTO)
+  # profile, which matters on GitHub-hosted runners.
+  RUST_PROFILE: release
+
+jobs:
+  build:
+    if: >-
+      inputs.tag != '' ||
+      contains(github.event.pull_request.labels.*.name, 'build-docker')
+    name: Build (${{ matrix.platform }})
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Runners match release.yml's native binary builds; the full compile
+          # needs more memory than the smallest GitHub-hosted runners provide.
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: github-hosted-2xlarge
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve image metadata
+        id: vars
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          # Docker image tags/version do not carry the leading v.
+          {
+            echo "full_hash=${SHA}"
+            echo "short_hash=${SHA::8}"
+            echo "image_version=${INPUT_TAG#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build image
+        id: build
+        uses: docker/bake-action@6614cfa25eff9a0b2b2697efb0b6159e7680d584 # v7.2.0
+        with:
+          source: .
+          files: docker-bake.hcl
+          targets: foundry
+          set: |
+            foundry.platform=${{ matrix.platform }}
+            foundry.args.RUST_PROFILE=${{ env.RUST_PROFILE }}
+            foundry.tags=
+            foundry.output=type=oci,tar=false,dest=/tmp/image
+        env:
+          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+          # Public arc-node is a public repo; the default workflow token is enough
+          # for the (optional) authenticated clone in the Dockerfile.
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE_VERSION: ${{ steps.vars.outputs.image_version }}
+          GIT_COMMIT_HASH: ${{ steps.vars.outputs.full_hash }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          input: /tmp/image
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL
+          limit-severities-for-sarif: true
+          exit-code: '1'
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-${{ matrix.arch }}
+          path: trivy-results.sarif
+
+      - name: Login to Cloudsmith
+        if: ${{ inputs.tag != '' }}
+        uses: ./.github/actions/cloudsmith-login
+        with:
+          registry: ${{ env.REGISTRY }}
+
+      - name: Push image by digest
+        if: ${{ inputs.tag != '' }}
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          BAKE_METADATA: ${{ steps.build.outputs.metadata }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          DIGEST=$(echo "${BAKE_METADATA}" | jq -r '.foundry."containerimage.digest"')
+          if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "null" ]; then
+            echo "::error::Failed to extract digest from build metadata"
+            exit 1
+          fi
+          skopeo copy "oci:/tmp/image" "docker://${IMAGE}@${DIGEST}" --digestfile /tmp/push-digest
+          rm -rf /tmp/image
+          REGISTRY_DIGEST=$(cat /tmp/push-digest)
+          PLATFORM_SLUG=$(echo "${MATRIX_PLATFORM}" | tr '/' '-')
+          mkdir -p /tmp/digests
+          echo "${REGISTRY_DIGEST}" > "/tmp/digests/${PLATFORM_SLUG}"
+
+      - name: Upload digest
+        if: ${{ inputs.tag != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  manifest:
+    if: ${{ inputs.tag != '' }}
+    name: Manifest
+    permissions:
+      contents: read
+      id-token: write
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          sparse-checkout: .github/actions
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to Cloudsmith
+        uses: ./.github/actions/cloudsmith-login
+        with:
+          registry: ${{ env.REGISTRY }}
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Create multi-arch manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          IMAGE_VERSION="${RELEASE_TAG#v}"
+          SHA="$(git rev-parse HEAD)"
+          SHORT_HASH="${SHA::8}"
+          TAG="${IMAGE}:${IMAGE_VERSION}"
+          SHA_TAG="${IMAGE}:${IMAGE_VERSION}-${SHORT_HASH}"
+
+          DIGEST_ARGS=()
+          for f in /tmp/digests/*; do
+            DIGEST_ARGS+=("${IMAGE}@$(cat "$f")")
+          done
+          if [ ${#DIGEST_ARGS[@]} -eq 0 ]; then
+            echo "::error::No digest files found"
+            exit 1
+          fi
+
+          docker buildx imagetools create -t "${TAG}" -t "${SHA_TAG}" "${DIGEST_ARGS[@]}"
+          docker buildx imagetools inspect "${TAG}"
