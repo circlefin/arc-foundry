@@ -33,8 +33,9 @@ build: ## Build the project.
 	cargo build --locked --features "$(FEATURES)" --profile "$(PROFILE)"
 
 .PHONY: build-docker
-build-docker: ## Build the docker image.
+build-docker: ## Build the docker image. Set GITHUB_TOKEN to fetch private git deps.
 	docker build . -t "$(DOCKER_IMAGE_NAME)" \
+	--secret "id=github_token,env=GITHUB_TOKEN" \
 	--build-arg "RUST_PROFILE=$(PROFILE)" \
 	--build-arg "RUST_FEATURES=$(FEATURES)" \
 	--build-arg "TAG_NAME=dev" \

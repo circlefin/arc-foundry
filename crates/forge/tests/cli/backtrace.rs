@@ -287,9 +287,17 @@ forgetest!(test_library_backtrace, |prj, cmd| {
         include_str!("../fixtures/backtraces/LibraryBacktrace.t.sol"),
     );
 
-    // Add foundry.toml configuration for linked library
+    // Add foundry.toml configuration for linked library.
+    //
+    // Pin solc: this test snapshots the full compiler output, which includes the
+    // imported `src/Vm.sol`. That file carries a `pragma experimental ABIEncoderV2`
+    // (deprecated since the coder became the default), and newer solc releases emit
+    // an "Experimental pragma ABIEncoderV2 is deprecated" warning for it. With an
+    // unpinned `^0.8.0`, forge picks the newest solc, so a new release silently
+    // shifts the output and breaks the snapshot. Pinning keeps it deterministic.
     let config = foundry_config::Config {
         libraries: vec!["src/libraries/ExternalMathLib.sol:ExternalMathLib:0x1234567890123456789012345678901234567890".to_string()],
+        solc: Some(foundry_config::SolcReq::Version(semver::Version::new(0, 8, 27))),
         ..Default::default()
     };
     prj.write_config(config);
