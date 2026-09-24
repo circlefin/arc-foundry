@@ -69,8 +69,8 @@ test: ## Run all tests.
 
 .PHONY: fmt
 fmt: ## Run all formatters.
-	cargo +nightly fmt
-	./.github/scripts/format.sh --check
+	cargo +nightly fmt && \
+	cargo fmt --all --check
 
 .PHONY: lint-clippy
 lint-clippy: ## Run clippy on the codebase.
