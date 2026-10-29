@@ -430,6 +430,49 @@ pub type ArcFoundryEvm<'db, I> = ArcEvm<
     EthFrame,
 >;
 
+/// Seeds the Arc genesis predeploys (USDC `0x3600…`, `ProtocolConfig`, …) straight into the
+/// backend's in-memory state, so local (non-fork) `forge test` runs can call them without a
+/// `--fork-url`.
+///
+/// Call this once, before any transaction runs (e.g. at the top of the test runner's setup) — not
+/// from the per-transaction EVM factory. The genesis alloc is static data, so it is copied
+/// directly into the backend cache, from the same source and in the same shape
+/// [`arc_initial_base_fee`] reads it. Writing it here, ahead of execution, means:
+/// - no "genesis loaded" sentinel is needed (this runs exactly once, not once per transaction),
+/// - the first access to each account is a genuine cold access (EIP-2929: 2600 gas), with no
+///   journal bookkeeping required to undo a warm touch, and
+/// - a later `vm.etch`/`vm.store` on these addresses is never overwritten, because nothing re-seeds
+///   genesis after setup.
+///
+/// Fork mode is the caller's responsibility: forked state already carries the real predeploys, so
+/// this must not run there.
+pub fn seed_arc_genesis_predeploys<FEN: FoundryEvmNetwork>(
+    backend: &mut crate::backend::Backend<FEN>,
+    hardfork: ArcHardfork,
+) {
+    let chain_spec = capped_localdev_chainspec(hardfork);
+    for (address, account) in &chain_spec.inner.genesis.alloc {
+        let code = account.code.clone().map(revm::bytecode::Bytecode::new_raw);
+        backend.insert_account_info(
+            *address,
+            revm::state::AccountInfo {
+                balance: account.balance,
+                nonce: account.nonce.unwrap_or_default(),
+                code_hash: code
+                    .as_ref()
+                    .map_or(revm::primitives::KECCAK_EMPTY, |code| code.hash_slow()),
+                code,
+                account_id: None,
+            },
+        );
+        for (slot, value) in account.storage.clone().unwrap_or_default() {
+            backend
+                .insert_account_storage(*address, slot.into(), value.into())
+                .expect("arc genesis storage seeding failed");
+        }
+    }
+}
+
 impl FoundryEvmFactory for FoundryArcEvmFactory {
     type FoundryContext<'db> = EthEvmContext<&'db mut dyn DatabaseExt<Self>>;
 
@@ -466,6 +509,22 @@ impl FoundryEvmFactory for FoundryArcEvmFactory {
         inspector: &'db mut dyn FoundryInspectorExt<Self::FoundryContext<'db>>,
     ) -> Box<dyn NestedEvm<Spec = SpecId, Block = BlockEnv, Tx = TxEnv> + 'db> {
         Box::new(self.create_foundry_evm_with_inspector(db, evm_env, inspector))
+    }
+
+    fn seed_genesis_predeploys<FEN>(
+        &self,
+        backend: &mut crate::backend::Backend<FEN>,
+        networks: NetworkConfigs,
+    ) where
+        FEN: FoundryEvmNetwork<EvmFactory = Self>,
+    {
+        // Fork mode already carries the real predeploys; only seed local (non-fork) state.
+        if backend.is_in_forking_mode() {
+            return;
+        }
+        if let Some(hardfork) = networks.arc_hardfork() {
+            seed_arc_genesis_predeploys(backend, hardfork);
+        }
     }
 }
 

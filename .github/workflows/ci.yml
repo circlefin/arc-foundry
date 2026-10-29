@@ -22,6 +22,11 @@ env:
 
 jobs:
   check:
+    # Run only in this repository. The file is also kept on the upstream branch
+    # that mirrors into here, where GitHub-hosted runners are not permitted.
+    # Without this condition, every pull request on that branch would start the
+    # job there.
+    if: github.repository == 'circlefin/arc-foundry'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
