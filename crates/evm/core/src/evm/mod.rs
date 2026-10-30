@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use crate::{
     FoundryBlock, FoundryContextExt, FoundryInspectorExt, FoundryTransaction,
     FromAnyRpcTransaction,
-    backend::{DatabaseExt, JournaledState},
+    backend::{Backend, DatabaseExt, JournaledState},
 };
 use alloy_consensus::{SignableTransaction, Signed, transaction::SignerRecoverable};
 use alloy_evm::{
@@ -14,6 +14,7 @@ use alloy_primitives::{Address, Signature, U256};
 use alloy_rlp::Decodable;
 use foundry_common::{FoundryReceiptResponse, FoundryTransactionBuilder, fmt::UIfmt};
 use foundry_config::FromEvmVersion;
+use foundry_evm_networks::NetworkConfigs;
 use foundry_fork_db::{DatabaseError, ForkBlockEnv};
 use revm::{
     Database,
@@ -151,6 +152,24 @@ pub trait FoundryEvmFactory:
         evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
         inspector: &'db mut dyn FoundryInspectorExt<Self::FoundryContext<'db>>,
     ) -> Box<dyn NestedEvm<Spec = Self::Spec, Block = Self::BlockEnv, Tx = Self::Tx> + 'db>;
+
+    /// Seeds this network's genesis predeploys directly into `backend`, once, before any
+    /// transaction runs.
+    ///
+    /// Called from `Executor::new`, the single construction point shared by every executor
+    /// consumer (forge test, coverage, snapshot, script), so one implementation covers them all.
+    ///
+    /// The default is a no-op: most networks have no local predeploys, or obtain them from a fork.
+    /// A network with local predeploys (e.g. Arc's USDC / `ProtocolConfig`) overrides this to copy
+    /// its genesis alloc into the backend cache. Implementations must no-op in fork mode, where the
+    /// forked state already carries the real predeploys. This is the genesis sibling of
+    /// [`NetworkConfigs::inject_precompiles`].
+    fn seed_genesis_predeploys<FEN>(&self, backend: &mut Backend<FEN>, networks: NetworkConfigs)
+    where
+        FEN: FoundryEvmNetwork<EvmFactory = Self>,
+    {
+        let _ = (backend, networks);
+    }
 }
 
 /// Object-safe trait exposing the operations that cheatcode nested EVM closures need.

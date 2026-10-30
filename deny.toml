@@ -9,8 +9,6 @@ ignore = [
     "RUSTSEC-2024-0436",
     # https://rustsec.org/advisories/RUSTSEC-2025-0141 bincode is unmaintained
     "RUSTSEC-2025-0141",
-    # https://rustsec.org/advisories/RUSTSEC-2026-0097 rand is unsound with a custom logger
-    "RUSTSEC-2026-0097",
     # https://rustsec.org/advisories/RUSTSEC-2026-0173 proc-macro-error2 is unmaintained
     # (build-time proc-macro only; pulled in via alloy-sol-macro and reth).
     "RUSTSEC-2026-0173",
@@ -21,14 +19,10 @@ ignore = [
     # declaration handling can allocate without a bound. No fixed quick-junit,
     # inferno, or soldeer release is available for either advisory yet.
     "RUSTSEC-2026-0195",
-    # https://rustsec.org/advisories/RUSTSEC-2026-0247 bitmaps is unmaintained.
-    # No fixed imbl release is available yet: https://github.com/jneem/imbl/issues/170
-    "RUSTSEC-2026-0247",
     # https://rustsec.org/advisories/RUSTSEC-2025-0172 zip-extract is unmaintained.
-    # The author deprecated it and points to zip >= 2.4.0. It reaches us only
-    # through soldeer-core, which still declares zip-extract ^0.4.0 in its latest
-    # release (0.11.0), so no soldeer bump removes it. The advisory lists no
-    # patched version.
+    # It reaches us only through the soldeer-core 0.10.1 we pin; soldeer-core 0.12.1
+    # (2026-10-19) drops zip-extract, so bumping soldeer removes this (tracked with
+    # the zip advisories below). The advisory lists no patched zip-extract version.
     "RUSTSEC-2025-0172",
     # https://rustsec.org/advisories/RUSTSEC-2026-0118 hickory-proto NSEC3 loop and
     # https://rustsec.org/advisories/RUSTSEC-2026-0119 hickory-proto O(n^2) name
@@ -37,6 +31,48 @@ ignore = [
     # reth, and foundry runs no p2p DNS node.
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
+    # --- 2026-10 advisory DB refresh. The semver-reachable advisories from this
+    # batch were resolved in Cargo.lock (rustls-webpki, tokio, webpki-roots,
+    # webpki-root-certs, zstd-sys, pulldown-cmark); ctutils was fixed through the
+    # vendor/ctutils-compat shim; and svm-rs plus the compression-codecs /
+    # async-compression stack were bumped so the only remaining users of the
+    # vulnerable zip 4 / zstd 0.13 are the ones noted below. The entries that
+    # remain cannot move without an upstream release. ---
+    # https://rustsec.org/advisories/RUSTSEC-2026-0387 crypto-bigint timing
+    # variability. Reaches us only via elliptic-curve 0.13 (alloy-signer, k256,
+    # p256); the fix (crypto-bigint 0.7) needs elliptic-curve 0.14, which the alloy
+    # signing stack has not adopted (alloy-signer 2.5.0 still requires ^0.13).
+    "RUSTSEC-2026-0387",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0367 SUID/SGID preservation,
+    # https://rustsec.org/advisories/RUSTSEC-2026-0368 symlink extraction, and
+    # https://rustsec.org/advisories/RUSTSEC-2026-0369 symlink permissions in zip.
+    # After bumping svm-rs to 0.5.32 (now on zip 9), the only remaining user of the
+    # vulnerable zip 4 is soldeer-core 0.10.1, which extracts via zip-extract
+    # (RUSTSEC-2025-0172). zip-extract applies the archived unix mode, including
+    # SUID/SGID, through its own set_unix_mode, so bumping zip alone does not fix
+    # this path — the real fix is soldeer-core 0.12.1 (drops zip-extract).
+    # Exploitable only when `forge soldeer install` runs as root (e.g. a CI/Docker
+    # build) on an untrusted package.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0391 zstd abandoned-stream leak,
+    # https://rustsec.org/advisories/RUSTSEC-2026-0398 and
+    # https://rustsec.org/advisories/RUSTSEC-2026-0403 zstd-safe out-of-bounds
+    # decompression. compression-codecs / async-compression were bumped to the zstd
+    # 0.14 / zstd-safe 8 line; the vulnerable zstd 0.13 / zstd-safe 7 remain only
+    # under reth v2.2.0 (nippy-jar, cli-commands, zstd-compressors) and
+    # foundry-fork-db, which a reth bump would NOT fix (foundry-fork-db 0.27.0 and
+    # reth-zstd-compressors 0.8.2 still require ^0.13). We keep these ignored on
+    # reachability grounds: 0391's with_context is not called by the remaining
+    # users; 0398's Seekable module is not compiled (the seekable feature is off);
+    # and 0403 only affects raw decompress_stream, whose sole caller
+    # (compression-codecs) now uses the fixed 0.14 line, while the remaining users
+    # go through bulk / stream::read::Decoder / decode_all, which the advisory
+    # states are unaffected.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]
 
 # This section is considered when running `cargo deny check bans`.

@@ -25,8 +25,8 @@ use foundry_evm_core::{
     },
     decode::{RevertDecoder, SkipReason},
     evm::{
-        EthEvmNetwork, EvmEnvFor, FoundryEvmNetwork, HaltReasonFor, IntoInstructionResult, SpecFor,
-        TxEnvFor,
+        EthEvmNetwork, EvmEnvFor, FoundryEvmFactory, FoundryEvmNetwork, HaltReasonFor,
+        IntoInstructionResult, SpecFor, TxEnvFor,
     },
     utils::StateChangeset,
 };
@@ -136,6 +136,12 @@ impl<FEN: FoundryEvmNetwork> Executor<FEN> {
                 ..Default::default()
             },
         );
+
+        // Seed this network's genesis predeploys (e.g. Arc's USDC / ProtocolConfig) into the
+        // backend before any transaction runs, so local (non-fork) runs can call them without a
+        // fork. No-op for networks without local predeploys, and for fork mode. Done here, at the
+        // shared construction point, it covers forge test, coverage, snapshot, and script alike.
+        FEN::EvmFactory::default().seed_genesis_predeploys(&mut backend, inspector.networks);
 
         Self {
             backend: Arc::new(backend),

@@ -544,8 +544,8 @@ idna_adapter = "=1.1.0"
 rexpect = { git = "https://github.com/rust-cli/rexpect", rev = "2ed0b1898d7edaf6a85bedbae71a01cc578958fc" }
 # Tempo's commonware release requires ctutils 0.3 with a prerelease cmov, while
 # Arc's PQ precompile requires ctutils 0.4 with stable cmov. The two cmov versions cannot
-# coexist in one build, so `^0.3` requirements are redirected to 0.4.2 via the shim. Arc's
-# own `^0.4` requirement still resolves to the real crates.io 0.4.2.
+# coexist in one build, so `^0.3` requirements are redirected to 0.4.6 via the shim. Arc's
+# own `^0.4` requirement still resolves to the real crates.io 0.4.6.
 #
 # This is safe for a constant-time crate because 0.4.0's breaking changes were removals
 # (`BytesCtEq`/`BytesCtSelect`) and a trait split (`CtAssign` out of `CtSelect`) — both would

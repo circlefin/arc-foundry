@@ -33,6 +33,10 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+      # Keyless cosign signing and provenance/SBOM attestations mint a
+      # short-lived OIDC token (id-token) and write to the attestations API.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -63,18 +67,105 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          out="arc-foundry-${TAG}-${TARGET}.tar.gz"
+          # One base name for the archive and every sidecar it carries, so the
+          # SBOM, signature and attestation files sort next to the tarball.
+          base="arc-foundry-${TAG}-${TARGET}"
+          out="${base}.tar.gz"
           tar -czf "$out" -C target/release forge cast anvil
           shasum -a 256 "$out" > "$out.sha256"
+          {
+            echo "artifact=$out"
+            echo "checksum=$out.sha256"
+            echo "sbom=${base}.spdx.json"
+            echo "signature=${base}.sigstore.json"
+            echo "attestation=${base}.attestation.txt"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      - name: Generate SBOM (SPDX)
+        env:
+          SBOM: ${{ steps.package.outputs.sbom }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          syft scan dir:. \
+            --source-name arc-foundry \
+            --source-version "$TAG" \
+            -o spdx-json="$SBOM"
+
+      # Man pages are architecture-independent, so build them once on the
+      # linux-amd64 leg. help2man ships in apt but not on the base runner.
+      - name: Build man pages
+        id: man
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends help2man
+          help2man -N target/release/forge > forge.1
+          help2man -N target/release/cast > cast.1
+          help2man -N target/release/anvil > anvil.1
+          gzip forge.1 cast.1 anvil.1
+          out="arc-foundry-man-${TAG}.tar.gz"
+          tar -czf "$out" forge.1.gz cast.1.gz anvil.1.gz
           echo "artifact=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Provenance attestation (binaries + archive)
+        id: attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            target/release/forge
+            target/release/cast
+            target/release/anvil
+            ${{ steps.package.outputs.artifact }}
+
+      - name: SBOM attestation (archive)
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: ${{ steps.package.outputs.artifact }}
+          sbom-path: ${{ steps.package.outputs.sbom }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign archive with cosign (keyless)
+        env:
+          ARTIFACT: ${{ steps.package.outputs.artifact }}
+          SIGNATURE: ${{ steps.package.outputs.signature }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob \
+            --yes \
+            --bundle "$SIGNATURE" \
+            "$ARTIFACT"
+
+      - name: Record attestation URL
+        env:
+          ATTESTATION_URL: ${{ steps.attestation.outputs.attestation-url }}
+          ATTESTATION_FILE: ${{ steps.package.outputs.attestation }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ATTESTATION_URL" > "$ATTESTATION_FILE"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          # The man tarball only exists on the linux-amd64 leg; on other legs
+          # steps.man.outputs.artifact is empty and the action skips the blank
+          # line, so each leg uploads exactly the files it produced.
           files: |
             ${{ steps.package.outputs.artifact }}
-            ${{ steps.package.outputs.artifact }}.sha256
+            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.sbom }}
+            ${{ steps.package.outputs.signature }}
+            ${{ steps.package.outputs.attestation }}
+            ${{ steps.man.outputs.artifact }}
 
   # Build and publish the docker image (Cloudsmith) for this tag, in parallel
   # with the binary release above.
