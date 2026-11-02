@@ -522,7 +522,18 @@ impl FoundryEvmFactory for FoundryArcEvmFactory {
         if backend.is_in_forking_mode() {
             return;
         }
-        if let Some(hardfork) = networks.arc_hardfork() {
+        // `arc_hardfork()` is only populated when a hardfork is chosen explicitly — via
+        // `hardfork = "arc:zeroN"` (folded in by `EvmOpts::apply_arc_hardfork` /
+        // `Config::normalize_hardfork_settings`) or the `--network arc` CLI override (which routes
+        // through `NetworkConfigs::with_arc`). A project that enables Arc the way the README
+        // documents — `network = "arc"` in foundry.toml with no hardfork — deserializes to
+        // `arc_hardfork = None`, so fall back to Foundry's default local Arc hardfork here.
+        // Without this, that setup seeds nothing and predeploys like USDC are missing under
+        // `forge test` / `forge script`. Mirrors what anvil (`NodeConfig::get_hardfork`) already
+        // does for the same config.
+        let hardfork =
+            networks.arc_hardfork().or_else(|| networks.is_arc().then(default_local_arc_hardfork));
+        if let Some(hardfork) = hardfork {
             seed_arc_genesis_predeploys(backend, hardfork);
         }
     }
