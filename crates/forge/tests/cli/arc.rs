@@ -193,6 +193,22 @@ contract NonArcNoPredeploysTest {
 }
 "#;
 
+// Regression (README path): a project that enables Arc the documented way — `network = "arc"` in
+// foundry.toml with NO hardfork — must still get the genesis predeploys seeded. This deserializes
+// to `arc_hardfork = None`, the case `configure_arc_project` never hits because it uses
+// `with_arc()` (which pre-fills a default hardfork) plus an explicit `hardfork = "arc:zero6"`.
+const ARC_GENESIS_NETWORK_ONLY_TEST: &str = r#"
+pragma solidity ^0.8.20;
+
+contract ArcGenesisNetworkOnlyTest {
+    address constant USDC = 0x3600000000000000000000000000000000000000;
+
+    function test_predeploy_seeded_with_network_only() public view {
+        require(USDC.code.length > 0, "arc predeploy missing when only network = arc is set");
+    }
+}
+"#;
+
 // Subcommand coverage: `forge script` in local (non-fork) mode must also see Arc predeploys, since
 // it shares `Executor::new` with `forge test`. Seeding at that shared point (vs a test-only hook)
 // is what covers script too.
@@ -339,6 +355,21 @@ forgetest_init!(forge_test_arc_genesis_is_isolated_across_tests, |prj, cmd| {
 forgetest_init!(forge_test_arc_genesis_setup_store_persists, |prj, cmd| {
     prj.add_test("ArcGenesisStorePersists.t.sol", ARC_GENESIS_STORE_PERSISTS_TEST);
     configure_arc_project(&prj);
+
+    cmd.arg("test").assert_success();
+});
+
+forgetest_init!(forge_test_arc_genesis_seeded_with_network_only, |prj, cmd| {
+    prj.add_test("ArcGenesisNetworkOnly.t.sol", ARC_GENESIS_NETWORK_ONLY_TEST);
+
+    // Configure Arc exactly as the README does: `network = "arc"` with no hardfork. We can't reuse
+    // `configure_arc_project` here — it fills a hardfork and so never exercises the gap — so edit
+    // the profile directly and let the real deserialize path produce `arc_hardfork = None`.
+    let cfg_path = prj.config();
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(cfg.contains("[profile.default]"), "unexpected init foundry.toml layout:\n{cfg}");
+    let cfg = cfg.replacen("[profile.default]", "[profile.default]\nnetwork = \"arc\"", 1);
+    std::fs::write(&cfg_path, cfg).unwrap();
 
     cmd.arg("test").assert_success();
 });
