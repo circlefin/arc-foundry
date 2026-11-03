@@ -10,7 +10,8 @@ parameters but use the wrong return type.
 
 For each function whose name and parameter types match a canonical ERC20 method
 (`totalSupply`, `balanceOf`, `transfer`, `transferFrom`, `approve`, `allowance`), the lint checks
-that the return type matches the spec. A mismatch is reported.
+that the return type matches the spec. A mismatch is reported. Only contracts and interfaces that
+are named `ERC20`/`IERC20` or inherit from one are inspected.
 
 ## Why is this bad?
 
@@ -22,7 +23,7 @@ lending protocols, multisigs) and are a common source of integration bugs and ex
 ### Bad
 
 ```solidity
-interface IBadERC20 {
+interface IBadERC20 is IERC20 {
     function balanceOf(address) external view returns (bool);  // should be uint256
     function transfer(address, uint256) external;              // should return bool
 }
