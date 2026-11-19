@@ -95,9 +95,14 @@ jobs:
           source: .
           files: docker-bake.hcl
           targets: foundry
+          # TAG_NAME keeps the leading `v`: crates/common/build.rs only uses it as
+          # the `--version` string when it is `v`-prefixed, otherwise it appends it
+          # to the Cargo.toml version (1.7.1-0.8.0-4). The image tag still uses the
+          # v-less IMAGE_VERSION below.
           set: |
             foundry.platform=${{ matrix.platform }}
             foundry.args.RUST_PROFILE=${{ env.RUST_PROFILE }}
+            foundry.args.TAG_NAME=${{ inputs.tag || 'dev' }}
             foundry.tags=
             foundry.output=type=oci,tar=false,dest=/tmp/image
         env:

@@ -57,7 +57,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # crates/common/build.rs reads TAG_NAME to stamp `--version`; a `v`-prefixed
+      # tag becomes the version as-is (v0.8.0-4 -> 0.8.0-4). Unset, it falls back
+      # to `<Cargo.toml version>-dev`.
       - name: Build release binaries
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
         run: cargo build --release --bins
 
       - name: Package
